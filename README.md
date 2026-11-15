@@ -1,3 +1,5 @@
+> **Test / sandbox copy.** This repository is a sanitized snapshot for testing the wholesale API. It is **not** the production store or its deployment. There are no secrets in this repo; all configuration is supplied via environment variables (see [`.env.example`](./.env.example)).
+
 # DisplayCellPros Storefront
 
 A headless commerce storefront for **DisplayCellPros** — **Next.js (Pages Router, v16)** for rendering, the **Shopify Storefront API** for product/cart/checkout data, and **Builder.io** as the visual CMS driving page content.
