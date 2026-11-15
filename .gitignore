@@ -1,0 +1,68 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+node_modules
+/.pnp
+.pnp.js
+
+# testing
+/coverage
+
+# next.js
+.next/
+out/
+*.tsbuildinfo
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# IDE state (machine-local, not shared)
+.idea/
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+mcp-debug.log
+
+# env files (never commit real credentials)
+.env
+.env*.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.development
+.env.production
+
+# vercel
+.vercel
+
+# nested git worktrees used to isolate concurrent agent sessions
+.worktrees/
+.claude/worktrees/
+
+# dev
+framework
+
+# cloned repos
+ai/
+commerce/
+swr/
+turborepo/
+
+# agent artifacts
+.artifacts/
+.env*
+/chrome-devtools-mcp
+!.env.example
+
+# npm is the only package manager; AI Studio / builder exports add these
+bun.lock
+bun.lockb
+yarn.lock
+pnpm-lock.yaml
+/superpowers/

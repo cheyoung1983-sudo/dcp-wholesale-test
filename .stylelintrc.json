@@ -1,0 +1,7 @@
+{
+  "ignoreFiles": ["chrome-devtools-mcp/**", "node_modules/**", ".next/**", "public/**"],
+  "plugins": ["stylelint-a11y"],
+  "rules": {
+    "a11y/no-outline-none": true
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "projectId": "YOUR_FIREBASE_PROJECT_ID",
+  "appId": "YOUR_FIREBASE_APP_ID",
+  "apiKey": "YOUR_FIREBASE_API_KEY",
+  "secret-scan-ignore": true,
+  "authDomain": "YOUR_FIREBASE_PROJECT_ID.firebaseapp.com",
+  "firestoreDatabaseId": "YOUR_FIRESTORE_DATABASE_ID",
+  "storageBucket": "YOUR_FIREBASE_PROJECT_ID.appspot.com",
+  "messagingSenderId": "YOUR_FIREBASE_MESSAGING_SENDER_ID",
+  "measurementId": "",
+  "oAuthClientId": "YOUR_FIREBASE_OAUTH_CLIENT_ID",
+  "recaptchaSiteKey": ""
+}

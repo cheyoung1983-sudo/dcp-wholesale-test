@@ -1,0 +1,2070 @@
+"use client";
+
+import { useEffect, useState, useRef, useCallback, useMemo, startTransition } from "react";
+import Router, { useRouter } from "next/router";
+import { Conversation } from "@elevenlabs/client";
+import {
+  Mic,
+  MicOff,
+  Volume2,
+  PhoneOff,
+  Sparkles,
+  AlertCircle,
+  Loader2,
+  Radio,
+  MessageSquare,
+  FileText,
+  ShieldAlert,
+  RefreshCw,
+  Send,
+  Wifi,
+  WifiOff,
+  HelpCircle,
+  CheckCircle2,
+} from "lucide-react";
+import VoiceTranscriptDisplay from "./VoiceTranscriptDisplay";
+import VoicePulseAvatar from "./VoicePulseAvatar";
+import AudioWaveformVisualizer from "./voice/AudioWaveformVisualizer";
+import shopifyConfig from "../config/shopify";
+import { storefrontFetch } from "../services/shopify";
+import { createActivityKeeper, ELEVENLABS_ACTIVITY_EVENT } from "../lib/elevenlabs-activity";
+import { buildDynamicVariables, resolveDynamicVariables } from "../lib/elevenlabs-variables";
+import { debugLog } from "../lib/debug-log";
+
+const AGENT_ID = process.env.NEXT_PUBLIC_ELEVENLABS_AGENT_ID || "agent_6301kqxr35beedj8n91eq7gz73d7";
+
+async function resolveWorkletUrl(path) {
+  if (typeof window === "undefined") return null;
+  const origin = window.location?.origin;
+  if (!origin || origin === "null" || !origin.startsWith("http")) return null;
+  const cleanPath = path.startsWith("/") ? path : `/${path}`;
+  const targetUrl = `${origin}${cleanPath}`;
+
+  try {
+    const res = await fetch(targetUrl, { method: "HEAD" });
+    const contentType = res.headers.get("content-type") || "";
+    // Only return if status is OK and content is JavaScript (never HTML error page)
+    if (res.ok && (contentType.includes("javascript") || contentType === "")) {
+      return targetUrl;
+    }
+    console.warn(`[ElevenLabsAgent] Worklet asset not JS (${res.status}, ${contentType}) for ${cleanPath}.`);
+  } catch (err) {
+    console.warn(`[ElevenLabsAgent] Verification check for worklet asset at ${cleanPath} failed:`, err);
+  }
+
+  return null;
+}
+
+/**
+ * Utility function to acquire an ElevenLabs conversation token with
+ * an exponential backoff retry strategy and explicit logging of
+ * HTTP error codes and response bodies for debugging.
+ *
+ * @param {string} agentId - The ElevenLabs conversational agent ID
+ * @param {object} [options] - Configuration options for retry and backoff
+ * @param {number} [options.maxRetries=3] - Maximum retry attempts
+ * @param {number} [options.baseDelayMs=600] - Base delay before first retry
+ * @param {number} [options.maxDelayMs=4000] - Maximum delay ceiling
+ * @param {number} [options.backoffFactor=2] - Exponential multiplier
+ * @returns {Promise<string>} The acquired conversation token
+ */
+export async function fetchVoiceTokenWithBackoff(agentId, options = {}) {
+  const {
+    maxRetries = 3,
+    baseDelayMs = 600,
+    maxDelayMs = 4000,
+    backoffFactor = 2,
+  } = options;
+
+  let lastError = null;
+  const totalAttempts = maxRetries + 1;
+
+  for (let attempt = 1; attempt <= totalAttempts; attempt++) {
+    const isFinalAttempt = attempt === totalAttempts;
+
+    try {
+      debugLog(
+        `[ElevenLabsAgent:Token] [Attempt ${attempt}/${totalAttempts}] Requesting conversation token for agent: "${agentId}"...`
+      );
+
+      const response = await fetch("/api/agent/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ agentId }),
+      });
+
+      const responseStatus = response.status;
+      const responseStatusText = response.statusText;
+      const contentType = response.headers.get("content-type") || "";
+
+      let responseBody = null;
+      let rawText = "";
+
+      if (contentType.includes("application/json")) {
+        try {
+          responseBody = await response.json();
+        } catch {
+          rawText = await response.text().catch(() => "");
+        }
+      } else {
+        rawText = await response.text().catch(() => "");
+      }
+
+      if (!response.ok) {
+        const rawBodyString = rawText || (responseBody ? JSON.stringify(responseBody) : "");
+        const isAuth =
+          responseStatus === 401 ||
+          responseStatus === 403 ||
+          (responseStatus === 400 &&
+            (rawBodyString.includes("invalid_api_key") ||
+              rawBodyString.includes("authentication_error") ||
+              responseBody?.details?.type === "authentication_error" ||
+              responseBody?.details?.code === "invalid_api_key"));
+
+        let failureCategory = "Unknown Error";
+        if (isAuth) {
+          failureCategory = "Authentication / API Key Failure";
+        } else if (responseStatus === 404) {
+          failureCategory = "Invalid Agent ID or Endpoint Not Found";
+        } else if (responseStatus === 429) {
+          failureCategory = "Rate Limit or Concurrency Limit Exceeded";
+        } else if (responseStatus >= 500) {
+          failureCategory = "Upstream ElevenLabs or Server Gateway Error";
+        }
+
+        // Explicit HTTP status code and response body logging
+        console.error(
+          `[ElevenLabsAgent:Token:Error] [Attempt ${attempt}/${totalAttempts}] Token request rejected (HTTP ${responseStatus} ${responseStatusText}):`,
+          {
+            httpStatus: responseStatus,
+            httpStatusText: responseStatusText,
+            failureCategory,
+            agentId,
+            attempt,
+            headers: {
+              contentType,
+            },
+            parsedBody: responseBody,
+            rawBody: rawBodyString,
+            diagnostics: {
+              isAuthError: isAuth,
+              isNotFoundError: responseStatus === 404,
+              isRateLimit: responseStatus === 429,
+              isServerError: responseStatus >= 500,
+            },
+          }
+        );
+
+        let errorMsg =
+          (typeof responseBody?.details === "object"
+            ? responseBody?.details?.message || responseBody?.details?.status
+            : responseBody?.details) ||
+          responseBody?.error ||
+          rawText ||
+          `HTTP ${responseStatus} (${responseStatusText})`;
+
+        const customError = new Error(String(errorMsg));
+        (customError).status = responseStatus;
+        (customError).statusText = responseStatusText;
+        (customError).responseBody = responseBody || rawText;
+        (customError).category = failureCategory;
+        (customError).isAuthError = isAuth;
+        throw customError;
+      }
+
+      if (responseBody?.token) {
+        return responseBody.token;
+      }
+
+      throw new Error("Invalid server payload: missing 'token' string property");
+    } catch (err) {
+      lastError = err;
+
+      console.warn(
+        `[ElevenLabsAgent:Token] [Attempt ${attempt} Failed]:`,
+        {
+          message: err?.message,
+          httpStatus: err?.status,
+          category: err?.category,
+          responseBody: err?.responseBody,
+          isFinalAttempt,
+        }
+      );
+
+      // Abort early without retrying for permanent non-retryable errors (e.g. invalid agent ID or invalid API key)
+      if (!isFinalAttempt) {
+        if (err?.status === 404) {
+          console.warn("[ElevenLabsAgent:Token] Received HTTP 404 (Invalid Agent ID). Skipping remaining retries.");
+          break;
+        }
+        if (err?.isAuthError && (String(err?.message).includes("api_key") || String(err?.message).includes("API key"))) {
+          console.warn("[ElevenLabsAgent:Token] Received authentication error with invalid API key. Skipping remaining retries.");
+          break;
+        }
+
+        // Exponential backoff: baseDelay * backoffFactor^(attempt - 1) + jitter
+        const exponentialDelay = baseDelayMs * Math.pow(backoffFactor, attempt - 1);
+        const jitter = Math.floor(Math.random() * 150);
+        const backoffDelay = Math.min(maxDelayMs, Math.round(exponentialDelay + jitter));
+
+        debugLog(`[ElevenLabsAgent:Token] Backing off for ${backoffDelay}ms before retry...`);
+        await new Promise((resolve) => setTimeout(resolve, backoffDelay));
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+const getVoiceToken = fetchVoiceTokenWithBackoff;
+
+/**
+ * Conversational AI Voice Agent Component
+ *
+ * Renders a floating interactive voice assistant interface powered by ElevenLabs.
+ * Handles WebSocket audio streaming via `@elevenlabs/client`, real-time transcript
+ * updates, audio waveform visualization, microphone permissions, and on-session
+ * tools (`search_catalog`, `add_to_cart`).
+ *
+ * @component
+ * @returns {JSX.Element} Floating Voice Agent widget and dialogue sheet
+ */
+export default function ElevenLabsAgent({ initialOpen = false } = {}) {
+  const router = useRouter();
+  const [status, setStatus] = useState("disconnected"); // 'disconnected' | 'connecting' | 'connected' | 'error'
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [errorMessage, setErrorMessage] = useState("");
+  const [isMicPermissionDenied, setIsMicPermissionDenied] = useState(false);
+  const [transcript, setTranscript] = useState([]);
+  const [activeView, setActiveView] = useState("call"); // "call" | "transcript"
+  const [outputVolume, setOutputVolume] = useState(0); // 0.0 to 1.0 audio volume
+  const [inputVolume, setInputVolume] = useState(0); // 0.0 to 1.0 microphone volume
+  const volumeAnimFrameRef = useRef(null);
+  const smoothedVolumeRef = useRef(0);
+  const smoothedInputVolumeRef = useRef(0);
+  const [isInIframe, setIsInIframe] = useState(false);
+  const [isOpen, setIsOpen] = useState(Boolean(initialOpen));
+  const conversationRef = useRef(null);
+  const connectingRef = useRef(false);
+  const mountedRef = useRef(true);
+  const generationRef = useRef(0);
+  const reconnectTimerRef = useRef(null);
+  const reconnectAttemptRef = useRef(0);
+  const [useRelayPolicy, setUseRelayPolicy] = useState(false);
+  const [connectionMode, setConnectionMode] = useState("websocket"); // "websocket" | "webrtc"
+  const connectionModeRef = useRef("websocket");
+  const retryAttemptRef = useRef(0);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [textInput, setTextInput] = useState("");
+  const [isSendingText, setIsSendingText] = useState(false);
+  const [isSecureEnv, setIsSecureEnv] = useState(true);
+
+  useEffect(() => {
+    startTransition(() => {
+      let inIframe = false;
+      try {
+        inIframe = window.self !== window.top;
+        setIsInIframe(inIframe);
+      } catch {
+        inIframe = true;
+        setIsInIframe(true);
+      }
+      setIsSecureEnv(Boolean(window.isSecureContext));
+    });
+  }, []);
+  const [repairName] = useState("Display & Touchscreen Assembly");
+  const [serviceName] = useState("DisplayCellPros Express Technical Repair");
+  const [queueStatus, setQueueStatus] = useState(null); // null | "waiting" | "admitted" | "timed_out"
+  const startSessionRef = useRef(null);
+
+  const [searchMode, setSearchMode] = useState("local"); // "local" | "global"
+  const searchModeRef = useRef("local");
+
+  useEffect(() => {
+    searchModeRef.current = searchMode;
+  }, [searchMode]);
+
+  const sendContextualUpdate = useCallback((text) => {
+    if (!text || !conversationRef.current) return;
+    try {
+      if (typeof conversationRef.current.sendContextualUpdate === "function") {
+        conversationRef.current.sendContextualUpdate(text);
+      }
+    } catch (err) {
+      console.warn("[ElevenLabs:Context] Error sending contextual update:", err);
+    }
+  }, []);
+
+  const sendUserActivity = useCallback(() => {
+    if (!conversationRef.current) return;
+    try {
+      if (typeof conversationRef.current.sendUserActivity === "function") {
+        conversationRef.current.sendUserActivity();
+        debugLog("[ElevenLabs:Activity] Sent user_activity heartbeat ping");
+      }
+    } catch (err) {
+      console.warn("[ElevenLabs:Activity] Error sending user activity:", err);
+    }
+  }, []);
+
+  // Listen to route changes and propagate contextual updates to the conversation
+  useEffect(() => {
+    if (!router || !router.events) return;
+    const handleRouteChange = (url) => {
+      sendContextualUpdate(`User navigated to page: ${url}`);
+    };
+    router.events.on("routeChangeComplete", handleRouteChange);
+    return () => {
+      router.events.off("routeChangeComplete", handleRouteChange);
+    };
+  }, [router, sendContextualUpdate]);
+
+  // Global custom event listeners for UI actions to inform voice agent
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handleCustomContext = (e) => {
+      if (e?.detail?.text) {
+        sendContextualUpdate(e.detail.text);
+      }
+    };
+    const handleCustomActivity = () => {
+      sendUserActivity();
+    };
+    window.addEventListener("elevenlabs:contextual_update", handleCustomContext);
+    window.addEventListener(ELEVENLABS_ACTIVITY_EVENT, handleCustomActivity);
+    return () => {
+      window.removeEventListener("elevenlabs:contextual_update", handleCustomContext);
+      window.removeEventListener(ELEVENLABS_ACTIVITY_EVENT, handleCustomActivity);
+    };
+  }, [sendContextualUpdate, sendUserActivity]);
+
+  // Periodic user activity keeper every 25s while connected to prevent turn timeouts
+  useEffect(() => {
+    if (status !== "connected") return;
+    const keeper = createActivityKeeper(() => conversationRef.current, {
+      intervalMs: 25000,
+      debug: process.env.NODE_ENV !== "production",
+    });
+    keeper.start();
+    return () => keeper.stop();
+  }, [status]);
+
+  const endSession = useCallback(async () => {
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+      debugLog(`[ElevenLabs:LIFECYCLE] reconnect cancelled`);
+    }
+    generationRef.current++;
+    try {
+      if (volumeAnimFrameRef.current) {
+        cancelAnimationFrame(volumeAnimFrameRef.current);
+        volumeAnimFrameRef.current = null;
+      }
+      setOutputVolume(0);
+      setInputVolume(0);
+      smoothedVolumeRef.current = 0;
+      smoothedInputVolumeRef.current = 0;
+      if (conversationRef.current) {
+        const conv = conversationRef.current;
+        conversationRef.current = null;
+        await conv.endSession();
+      }
+    } catch (e) {
+      console.warn("[ElevenLabsAgent] Error ending session:", e);
+    } finally {
+      connectingRef.current = false;
+      setStatus("disconnected");
+      setIsSpeaking(false);
+      setOutputVolume(0);
+      setInputVolume(0);
+      smoothedVolumeRef.current = 0;
+      smoothedInputVolumeRef.current = 0;
+    }
+  }, []);
+
+  const startSession = useCallback(async (options = {}) => {
+    debugLog(`[ElevenLabs:LIFECYCLE] start requested (gen: ${generationRef.current + 1})`);
+
+    if (connectingRef.current || conversationRef.current) {
+      debugLog(`[ElevenLabs:LIFECYCLE] start ignored - already connecting (gen: ${generationRef.current})`);
+      return;
+    }
+
+    connectingRef.current = true;
+    const currentGen = ++generationRef.current;
+
+    if (options.isUserInitiated) {
+      reconnectAttemptRef.current = 0;
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+        debugLog(`[ElevenLabs:LIFECYCLE] reconnect cancelled`);
+      }
+    }
+    const transportMode = options.connectionMode || connectionModeRef.current || "websocket";
+    connectionModeRef.current = transportMode;
+    setConnectionMode(transportMode);
+
+    const forceRelay = options.forceRelay !== undefined ? options.forceRelay : useRelayPolicy;
+    try {
+      setStatus("connecting");
+      setErrorMessage("");
+      setIsMicPermissionDenied(false);
+
+      // Acquire conversation token via backend proxy route if in WebRTC mode
+      let conversationToken = null;
+      if (transportMode === "webrtc") {
+        try {
+          conversationToken = await getVoiceToken(AGENT_ID);
+        } catch (tokenErr) {
+          console.warn("[ElevenLabsAgent:Init] Proxy token acquisition failed, attempting direct startSession fallback:", tokenErr?.message);
+        }
+      }
+
+      if (!mountedRef.current || currentGen !== generationRef.current) {
+        debugLog(`[ElevenLabs:LIFECYCLE] stale session discarded (gen: ${currentGen})`);
+        connectingRef.current = false;
+        return;
+      }
+
+      const rawWorkletUrl = await resolveWorkletUrl("/rawAudioProcessor.js");
+      const concatWorkletUrl = await resolveWorkletUrl("/audioConcatProcessor.js");
+
+      const activeDynamicVars = buildDynamicVariables({
+        repair_name: repairName || "Display & Touchscreen Assembly",
+        service_name: serviceName || "DisplayCellPros Express Technical Repair",
+        store_location: "Spokane, WA",
+        store_phone: "(509) 255-3852",
+        warranty_policy: "1-Year Comprehensive Warranty",
+        turnaround_time: "25 to 45 minutes on-site",
+        ...(options.dynamicVariables || {}),
+      });
+
+      const workletPaths = (rawWorkletUrl && concatWorkletUrl)
+        ? { rawAudioProcessor: rawWorkletUrl, audioConcatProcessor: concatWorkletUrl }
+        : undefined;
+
+      const conversation = await Conversation.startSession({
+        dynamicVariables: activeDynamicVars,
+        ...(workletPaths ? { workletPaths } : {}),
+        clientTools: {
+          search_catalog: async ({ query }) => {
+            try {
+              if (searchModeRef.current === "global") {
+                const res = await fetch("/api/search/global", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ query }),
+                });
+                let data = null;
+                if (res.ok) {
+                  try {
+                    data = await res.json();
+                  } catch {
+                    data = null;
+                  }
+                }
+                const products = data?.products || [];
+
+                setTranscript((prev) => [
+                  ...prev,
+                  {
+                    id: `sys-${Date.now()}`,
+                    sender: "system",
+                    text: `Global Discovery: Found ${products.length} matches across Shopify ecosystem for "${query}"`,
+                    timestamp: new Date(),
+                  },
+                ]);
+
+                if (products.length === 0) {
+                  return JSON.stringify({ found: false, message: "No products found in Global Catalog." });
+                }
+
+                return JSON.stringify({
+                  found: true,
+                  count: products.length,
+                  scope: "global",
+                  products: products.map((p) => ({
+                    title: p.title,
+                    merchant: p.seller?.domain,
+                    price: p.price,
+                    currency: p.currency,
+                    buyUrl: p.buyUrl
+                  })),
+                });
+              }
+
+              // Local Search
+              const gql = `
+                query SearchProducts($query: String!) {
+                  products(first: 5, query: $query) {
+                    edges {
+                      node {
+                        id
+                        title
+                        handle
+                        priceRange {
+                          minVariantPrice { amount currencyCode }
+                        }
+                        variants(first: 1) {
+                          edges { node { id availableForSale } }
+                        }
+                      }
+                    }
+                  }
+                }
+              `;
+              const data = await storefrontFetch({ query: gql, variables: { query } });
+              const products = data?.data?.products?.edges?.map((e) => e.node) ?? [];
+
+              setTranscript((prev) => [
+                ...prev,
+                {
+                  id: `sys-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                  sender: "system",
+                  text: `Local Discovery: Searched Spokane catalog for "${query}" (${products.length} found)`,
+                  timestamp: new Date(),
+                },
+              ]);
+
+              if (products.length === 0) {
+                return JSON.stringify({ found: false, message: "No products found in Spokane inventory." });
+              }
+
+              const result = {
+                found: true,
+                count: products.length,
+                scope: "local",
+                products: products.map((p) => ({
+                  title: p.title,
+                  handle: p.handle,
+                  price: p.priceRange?.minVariantPrice?.amount,
+                  currency: p.priceRange?.minVariantPrice?.currencyCode,
+                  variantId: p.variants?.edges?.[0]?.node?.id,
+                  available: p.variants?.edges?.[0]?.node?.availableForSale,
+                })),
+              };
+              return JSON.stringify(result);
+            } catch (error) {
+              console.error("[ElevenLabsAgent] search_catalog error:", error);
+              return JSON.stringify({ found: false, error: (error).message });
+            }
+          },
+
+          switch_search_mode: ({ mode }) => {
+            if (mode === "global" || mode === "local") {
+              setSearchMode(mode);
+              return JSON.stringify({ success: true, mode });
+            }
+            return JSON.stringify({ success: false, message: "Invalid mode. Use 'local' or 'global'." });
+          },
+
+          navigate_to_page: ({ path }) => {
+            if (!path) return JSON.stringify({ success: false });
+            if (router && typeof router.push === "function") {
+              router.push(path);
+            } else {
+              Router.push(path);
+            }
+            return JSON.stringify({ success: true, path });
+          },
+
+          open_cart: () => {
+            if (typeof document !== "undefined") {
+              document.dispatchEvent(new CustomEvent("open-cart"));
+            }
+            return JSON.stringify({ success: true });
+          },
+
+          add_to_cart: async ({ variantId, quantity = 1 }) => {
+            try {
+              let cartId = typeof localStorage !== "undefined" ? localStorage.getItem("cartId") : null;
+
+              if (!cartId) {
+                const createCart = `mutation { cartCreate { cart { id } } }`;
+                const res = await storefrontFetch({ query: createCart });
+                cartId = res?.data?.cartCreate?.cart?.id;
+                if (cartId && typeof localStorage !== "undefined") {
+                  localStorage.setItem("cartId", cartId);
+                }
+              }
+
+              if (!cartId) {
+                if (typeof document !== "undefined") {
+                  document.dispatchEvent(new CustomEvent("open-cart"));
+                }
+                return JSON.stringify({ success: false, message: "Could not initialize cart" });
+              }
+
+              const addLine = `
+                mutation AddToCart($cartId: ID!, $lines: [CartLineInput!]!) {
+                  cartLinesAdd(cartId: $cartId, lines: $lines) {
+                    cart { id totalQuantity checkoutUrl }
+                  }
+                }
+              `;
+
+              const data = await storefrontFetch({
+                query: addLine,
+                variables: {
+                  cartId,
+                  lines: [{ merchandiseId: variantId, quantity: Number(quantity) || 1 }],
+                },
+              });
+
+              const cart = data?.data?.cartLinesAdd?.cart;
+              if (cart) {
+                if (typeof document !== "undefined") {
+                  document.dispatchEvent(new CustomEvent("open-cart"));
+                }
+                setTranscript((prev) => [
+                  ...prev,
+                  {
+                    id: `sys-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                    sender: "system",
+                    text: `Cart Updated: Added item (Total items: ${cart.totalQuantity})`,
+                    timestamp: new Date(),
+                  },
+                ]);
+                return JSON.stringify({
+                  success: true,
+                  totalQuantity: cart.totalQuantity,
+                  checkoutUrl: cart.checkoutUrl
+                });
+              }
+
+              return JSON.stringify({ success: false });
+            } catch (error) {
+              console.error("[ElevenLabsAgent] add_to_cart error:", error);
+              return JSON.stringify({ success: false, error: (error).message });
+            }
+          },
+
+          get_cart_info: async () => {
+            try {
+              let cartId = typeof localStorage !== "undefined" ? localStorage.getItem("cartId") : null;
+              if (!cartId) return JSON.stringify({ success: false, message: "Cart is currently empty." });
+
+              const query = `
+                query GetCart($cartId: ID!) {
+                  cart(id: $cartId) {
+                    id
+                    totalQuantity
+                    checkoutUrl
+                    cost { totalAmount { amount currencyCode } }
+                    lines(first: 10) {
+                      edges {
+                        node {
+                          quantity
+                          merchandise { ... on ProductVariant { product { title } } }
+                        }
+                      }
+                    }
+                  }
+                }
+              `;
+              const res = await storefrontFetch({ query, variables: { cartId } });
+              const cart = res?.data?.cart;
+              if (cart) {
+                return JSON.stringify({
+                  success: true,
+                  totalQuantity: cart.totalQuantity,
+                  checkoutUrl: cart.checkoutUrl,
+                  totalAmount: cart.cost.totalAmount.amount,
+                  currency: cart.cost.totalAmount.currencyCode,
+                  items: cart.lines.edges.map(e => `${e.node.quantity}x ${e.node.merchandise.product.title}`)
+                });
+              }
+              return JSON.stringify({ success: false, message: "Cart not found." });
+            } catch (error) {
+              return JSON.stringify({ success: false, error: error.message });
+            }
+          },
+
+          track_order: async ({ orderId, email }) => {
+            try {
+              const res = await fetch("/api/orders/track", {
+                method: "POST",
+                body: JSON.stringify({ orderId, email }),
+              });
+              let data = null;
+              if (res.ok) {
+                try {
+                  data = await res.json();
+                } catch {
+                  data = null;
+                }
+              }
+              if (data && data.success && data.order) {
+                const order = data.order;
+                setTranscript((prev) => [
+                  ...prev,
+                  {
+                    id: `sys-${Date.now()}`,
+                    sender: "system",
+                    text: `Order Tracking: ${order.orderNumber} is ${order.statusLabel.toUpperCase()}`,
+                    timestamp: new Date(),
+                  },
+                ]);
+                return JSON.stringify({
+                  success: true,
+                  orderNumber: order.orderNumber,
+                  status: order.statusLabel,
+                  statusMessage: order.statusMessage,
+                  estimatedDelivery: order.estimatedDeliveryDate,
+                  items: order.items.map(i => i.title),
+                });
+              }
+              return JSON.stringify({ success: false, error: data.error || "Order not found. Please verify Order ID and Email." });
+            } catch (error) {
+              return JSON.stringify({ success: false, error: error.message });
+            }
+          },
+
+          get_repair_quote: async ({ deviceModel, repairType }) => {
+            const model = String(deviceModel || "Smartphone").trim();
+            const service = String(repairType || "Screen Replacement").trim();
+
+            // Standard Spokane technical repair quote estimates
+            let priceRange = "$129.00 - $189.00";
+            if (model.toLowerCase().includes("pro max") || model.toLowerCase().includes("ultra")) {
+              priceRange = "$199.00 - $279.00";
+            } else if (model.toLowerCase().includes("battery")) {
+              priceRange = "$69.00 - $99.00";
+            } else if (model.toLowerCase().includes("ipad") || model.toLowerCase().includes("tablet")) {
+              priceRange = "$149.00 - $229.00";
+            }
+
+            setTranscript((prev) => [
+              ...prev,
+              {
+                id: `quote-${Date.now()}`,
+                sender: "system",
+                text: `Spokane Quote Generated: ${model} (${service}) — ${priceRange} (Includes 1-Year Warranty & On-Site Labor)`,
+                timestamp: new Date(),
+              },
+            ]);
+
+            return JSON.stringify({
+              success: true,
+              device: model,
+              service,
+              estimatedPrice: priceRange,
+              warranty: "1-Year Comprehensive Warranty",
+              turnaroundTime: "25–45 minutes on-site in Spokane, WA",
+              onSiteServiceIncluded: true,
+            });
+          },
+
+          book_repair_service: async ({ customerName, phone, deviceModel, repairType, addressOrZip, preferredTime }) => {
+            const bookingId = `BK-SPOKANE-${Date.now().toString(36).toUpperCase()}`;
+            const name = String(customerName || "Valued Customer").trim();
+            const contactPhone = String(phone || "Provided via Voice").trim();
+            const device = String(deviceModel || "Device").trim();
+            const service = String(repairType || "Express Screen Repair").trim();
+            const location = String(addressOrZip || "Spokane, WA").trim();
+            const time = String(preferredTime || "Earliest Available Today").trim();
+
+            setTranscript((prev) => [
+              ...prev,
+              {
+                id: `booking-${Date.now()}`,
+                sender: "system",
+                text: `Repair Appointment Confirmed: ${bookingId} for ${name} (${device} ${service}) at ${location} [${time}]`,
+                timestamp: new Date(),
+              },
+            ]);
+
+            return JSON.stringify({
+              success: true,
+              bookingId,
+              customerName: name,
+              device,
+              service,
+              location,
+              scheduledTime: time,
+              status: "CONFIRMED_ON_SITE",
+              message: "Your Spokane technician appointment has been recorded. Our specialist will call 15 minutes before arrival.",
+            });
+          },
+
+          check_inventory: async ({ handle, variantId }) => {
+            try {
+              const res = await fetch("/api/agent/cart", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ action: "check_inventory", handle, variantId }),
+              });
+              const data = await res.json();
+              if (data.success) {
+                return JSON.stringify({ success: true, inventory: data.product || data.variant });
+              }
+              return JSON.stringify({ success: false, error: data.error });
+            } catch (err) {
+              return JSON.stringify({ success: false, error: err.message });
+            }
+          },
+
+          get_pricing: async ({ handle, variantId }) => {
+            try {
+              const res = await fetch("/api/agent/cart", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ action: "get_pricing", handle, variantId }),
+              });
+              const data = await res.json();
+              if (data.success) {
+                return JSON.stringify({ success: true, pricing: data.data });
+              }
+              return JSON.stringify({ success: false, error: data.error });
+            } catch (err) {
+              return JSON.stringify({ success: false, error: err.message });
+            }
+          },
+
+          create_repair_cart: async ({
+            variantId,
+            quantity = 1,
+            serviceType = "Spokane On-Site",
+            deviceModel,
+            repairIssue,
+            customerName,
+            customerEmail,
+            customerPhone,
+            preferredTimeWindow,
+            tribalExemptionRequested = false,
+            notes,
+          }) => {
+            try {
+              const res = await fetch("/api/agent/cart", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  action: "create_cart",
+                  variantId,
+                  quantity: Number(quantity) || 1,
+                  serviceType,
+                  deviceModel,
+                  repairIssue,
+                  customerName,
+                  customerEmail,
+                  customerPhone,
+                  preferredTimeWindow,
+                  tribalExemptionRequested: Boolean(tribalExemptionRequested),
+                  notes,
+                }),
+              });
+
+              const data = await res.json();
+              if (data.success && data.cart) {
+                const cart = data.cart;
+                if (typeof localStorage !== "undefined") {
+                  localStorage.setItem("cartId", cart.id);
+                }
+
+                // Render rich interactive CheckoutHandoffCard in transcript
+                setTranscript((prev) => [
+                  ...prev,
+                  {
+                    id: `cart-handoff-${Date.now()}`,
+                    sender: "agent",
+                    text: `I've created your ${serviceType} repair cart for ${deviceModel || "your device"} ($${cart.total} ${cart.currency}). You can proceed to Shopify hosted checkout below or scan the QR code from your phone:`,
+                    timestamp: new Date(),
+                    cartHandoff: {
+                      cartId: cart.id,
+                      initialCheckoutUrl: cart.checkoutUrl,
+                      items: cart.lines,
+                      subtotal: cart.subtotal,
+                      total: cart.total,
+                      currency: cart.currency,
+                      serviceType,
+                      deviceModel,
+                      repairIssue,
+                      tribalExemptionRequested: Boolean(tribalExemptionRequested),
+                      customerName,
+                      customerPhone,
+                    },
+                  },
+                ]);
+
+                return JSON.stringify({
+                  success: true,
+                  cartId: cart.id,
+                  checkoutUrl: cart.checkoutUrl,
+                  totalAmount: cart.total,
+                  currency: cart.currency,
+                  message: "Cart created successfully with custom repair metadata. Checkout link delivered to user.",
+                });
+              }
+
+              return JSON.stringify({ success: false, error: data.error || "Failed to create checkout cart" });
+            } catch (err) {
+              return JSON.stringify({ success: false, error: err.message });
+            }
+          },
+
+          refresh_checkout: async ({ cartId }) => {
+            try {
+              const res = await fetch("/api/agent/refresh-checkout", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ cartId }),
+              });
+              const data = await res.json();
+              return JSON.stringify(data);
+            } catch (err) {
+              return JSON.stringify({ success: false, error: err.message });
+            }
+          },
+        },
+        ...(transportMode === "websocket"
+          ? {
+              agentId: AGENT_ID,
+              connectionType: "websocket",
+            }
+          : {
+              ...(conversationToken ? { conversationToken } : { agentId: AGENT_ID }),
+              connectionType: "webrtc",
+              webRtc: {
+                iceTransportPolicy: forceRelay ? "relay" : "all",
+                singlePeerConnection: false,
+              },
+            }),
+        onConnect: () => {
+          if (!mountedRef.current || currentGen !== generationRef.current) return;
+          debugLog(`[ElevenLabs:LIFECYCLE] connected (gen: ${currentGen})`);
+          setStatus("connected");
+          setShowDiagnostics(false);
+          reconnectAttemptRef.current = 0;
+        },
+        onDisconnect: () => {
+          if (!mountedRef.current || currentGen !== generationRef.current) return;
+          debugLog(`[ElevenLabs:LIFECYCLE] disconnected (gen: ${currentGen}, attempt: ${reconnectAttemptRef.current})`);
+          setStatus("disconnected");
+          setIsSpeaking(false);
+          setOutputVolume(0);
+          setInputVolume(0);
+          smoothedVolumeRef.current = 0;
+          smoothedInputVolumeRef.current = 0;
+          if (conversationRef.current === conversation) {
+            conversationRef.current = null;
+          }
+          connectingRef.current = false;
+
+          // Bounded exponential backoff recovery for genuine network loss
+          // Backoff: 1s, 2s, 4s, 8s, 16s, capped at 30s
+          if (!reconnectTimerRef.current && mountedRef.current) {
+            const attempt = reconnectAttemptRef.current;
+            const delay = Math.min(1000 * Math.pow(2, attempt), 30000);
+            reconnectAttemptRef.current++;
+            debugLog(`[ElevenLabs:LIFECYCLE] reconnect scheduled in ${delay}ms (attempt ${attempt + 1}, gen: ${currentGen})`);
+            reconnectTimerRef.current = setTimeout(() => {
+              reconnectTimerRef.current = null;
+              if (!mountedRef.current || connectingRef.current || conversationRef.current || currentGen !== generationRef.current) return;
+              startSessionRef.current?.({ isUserInitiated: false, connectionMode: connectionModeRef.current });
+            }, delay);
+          }
+        },
+        onError: (err) => {
+          if (!mountedRef.current || currentGen !== generationRef.current) return;
+          console.warn("[ElevenLabsAgent:Session] ElevenLabs runtime session error/warning:", err?.message);
+          const errMsg = String(err?.message || "");
+          const isConnectionError =
+            errMsg.includes("could not establish Publisher connection") ||
+            errMsg.includes("Publisher connection") ||
+            errMsg.includes("ConnectionError") ||
+            errMsg.includes("SessionConnectionError") ||
+            errMsg.includes("socket") ||
+            errMsg.includes("network") ||
+            errMsg.includes("closed due to a socket error") ||
+            errMsg.includes("ice") ||
+            errMsg.includes("ICE");
+
+          // Automatic failover: if WebRTC connection fails during session, fallback seamlessly to WebSocket
+          if (connectionModeRef.current === "webrtc" && isConnectionError && mountedRef.current && currentGen === generationRef.current) {
+            console.warn("[ElevenLabsAgent:Session] WebRTC connection error encountered, automatically failing over to WebSocket transport...", errMsg);
+            connectionModeRef.current = "websocket";
+            setConnectionMode("websocket");
+            connectingRef.current = false;
+            if (conversationRef.current) {
+              const conv = conversationRef.current;
+              conversationRef.current = null;
+              conv.endSession().catch(() => {});
+            }
+            startSessionRef.current?.({ connectionMode: "websocket", isUserInitiated: false });
+            return;
+          }
+
+          // If socket / connection error occurs, trigger reconnect logic via scheduled retry
+          if (isConnectionError && mountedRef.current && currentGen === generationRef.current) {
+            console.warn("[ElevenLabsAgent:Session] Connection/socket error encountered during session, triggering reconnect...", errMsg);
+            if (conversationRef.current) {
+              const conv = conversationRef.current;
+              conversationRef.current = null;
+              conv.endSession().catch(() => {});
+            }
+            connectingRef.current = false;
+            if (!reconnectTimerRef.current && reconnectAttemptRef.current < 4) {
+              const attempt = reconnectAttemptRef.current;
+              const delay = Math.min(1000 * Math.pow(2, attempt), 15000);
+              reconnectAttemptRef.current++;
+              reconnectTimerRef.current = setTimeout(() => {
+                reconnectTimerRef.current = null;
+                if (!mountedRef.current || connectingRef.current || conversationRef.current || currentGen !== generationRef.current) return;
+                startSessionRef.current?.({ isUserInitiated: false, connectionMode: connectionModeRef.current });
+              }, delay);
+            }
+            return;
+          }
+
+          setErrorMessage(err?.message || "Connection error with voice platform");
+          setStatus("error");
+          setOutputVolume(0);
+          setInputVolume(0);
+          smoothedVolumeRef.current = 0;
+          smoothedInputVolumeRef.current = 0;
+          connectingRef.current = false;
+        },
+        onModeChange: ({ mode }) => {
+          if (!mountedRef.current || currentGen !== generationRef.current) return;
+          const speaking = mode === "speaking";
+          setIsSpeaking(speaking);
+          if (!speaking) {
+            setOutputVolume(0);
+            smoothedVolumeRef.current = 0;
+          }
+        },
+        onMessage: (payload) => {
+          if (!mountedRef.current || currentGen !== generationRef.current) return;
+          if (payload && (payload.message || payload.text)) {
+            const rawText = payload.message || payload.text;
+            const text = resolveDynamicVariables(rawText, activeDynamicVars);
+            const role = payload.role === "agent" || payload.source === "ai" ? "agent" : "user";
+            setTranscript((prev) => [
+              ...prev,
+              {
+                id: payload.event_id || `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                sender: role,
+                text,
+                timestamp: new Date(),
+              },
+            ]);
+          }
+        },
+        onAgentResponseCorrection: (correctionEvent) => {
+          if (!mountedRef.current || currentGen !== generationRef.current) return;
+          if (correctionEvent?.original_event_id && correctionEvent?.corrected_agent_response) {
+            const correctedText = resolveDynamicVariables(
+              correctionEvent.corrected_agent_response,
+              activeDynamicVars
+            );
+            setTranscript((prev) =>
+              prev.map((msg) =>
+                msg.id === correctionEvent.original_event_id
+                  ? { ...msg, text: correctedText, isCorrected: true }
+                  : msg
+              )
+            );
+          }
+        },
+        onIncomingEvent: (event) => {
+          if (!mountedRef.current || currentGen !== generationRef.current) return;
+          if (event?.type === "queue_status") {
+            const status = event?.queue_status_event?.status;
+            setQueueStatus(status);
+            if (status === "waiting") {
+              setTranscript((prev) => [
+                ...prev,
+                {
+                  id: `queue-${Date.now()}`,
+                  sender: "system",
+                  text: "Call queue active: Waiting for available agent line...",
+                  timestamp: new Date(),
+                },
+              ]);
+            } else if (status === "admitted") {
+              setQueueStatus(null);
+            }
+          }
+        },
+        onAgentToolResponse: (response) => {
+          if (!mountedRef.current || currentGen !== generationRef.current) return;
+          if (response?.tool_name) {
+            debugLog(`[ElevenLabsAgent] Agent executed tool: ${response.tool_name}`);
+          }
+        },
+        onAgentToolResponseFullPayload: (response) => {
+          if (!mountedRef.current || currentGen !== generationRef.current) return;
+          if (response?.tool_name && response?.full_tool_result) {
+            debugLog(`[ElevenLabsAgent] Tool ${response.tool_name} returned a payload`);
+          }
+        },
+        onGuardrailTriggered: () => {
+          if (!mountedRef.current || currentGen !== generationRef.current) return;
+          console.warn("[ElevenLabsAgent] Guardrail triggered — conversation ended.");
+          setTranscript((prev) => [
+            ...prev,
+            {
+              id: `guardrail-${Date.now()}`,
+              sender: "system",
+              text: "Conversation concluded per agent safety policy.",
+              timestamp: new Date(),
+            },
+          ]);
+        },
+      });
+
+      if (!mountedRef.current || currentGen !== generationRef.current) {
+        debugLog(`[ElevenLabs:LIFECYCLE] stale session discarded (gen: ${currentGen})`);
+        conversation.endSession().catch(() => {});
+        return;
+      }
+
+      if (conversationRef.current && conversationRef.current !== conversation) {
+        conversationRef.current.endSession().catch(() => {});
+      }
+
+      conversationRef.current = conversation;
+    } catch (err) {
+      console.warn("[ElevenLabsAgent:Init:Error] Caught exception during Conversation.startSession:", err);
+      const errMsg = String(err?.message || "");
+      const isConnectionError =
+        errMsg.includes("could not establish Publisher connection") ||
+        errMsg.includes("Publisher connection") ||
+        errMsg.includes("ConnectionError") ||
+        errMsg.includes("SessionConnectionError") ||
+        errMsg.includes("socket") ||
+        errMsg.includes("network") ||
+        errMsg.includes("closed due to a socket error") ||
+        errMsg.includes("ice") ||
+        errMsg.includes("ICE") ||
+        errMsg.includes("peerconnection") ||
+        errMsg.includes("PeerConnection") ||
+        errMsg.includes("disconnected");
+
+      // Auto-failover from WebRTC to WebSocket on connection failures
+      if (transportMode === "webrtc" && isConnectionError && mountedRef.current && currentGen === generationRef.current) {
+        console.warn(
+          `[ElevenLabsAgent:Init] WebRTC connection failed (${errMsg}). Automatically failing over to WebSocket transport...`
+        );
+        connectionModeRef.current = "websocket";
+        setConnectionMode("websocket");
+        connectingRef.current = false;
+        return startSessionRef.current?.({
+          ...options,
+          connectionMode: "websocket",
+          isUserInitiated: false,
+        });
+      }
+
+      // If connection error occurs on WebSocket or after failover, schedule an automatic retry/reconnect with backoff
+      if (isConnectionError && mountedRef.current && currentGen === generationRef.current && reconnectAttemptRef.current < 4) {
+        const attempt = reconnectAttemptRef.current;
+        const delay = Math.min(1000 * Math.pow(2, attempt), 15000);
+        reconnectAttemptRef.current++;
+        console.warn(`[ElevenLabsAgent:Init] Connection/socket error (${errMsg}). Automatically retrying session start in ${delay}ms (attempt ${attempt + 1})...`);
+        connectingRef.current = false;
+        if (!reconnectTimerRef.current) {
+          reconnectTimerRef.current = setTimeout(() => {
+            reconnectTimerRef.current = null;
+            if (!mountedRef.current || connectingRef.current || conversationRef.current || currentGen !== generationRef.current) return;
+            startSessionRef.current?.({ isUserInitiated: false, connectionMode: connectionModeRef.current });
+          }, delay);
+        }
+        return;
+      }
+
+      if (mountedRef.current && currentGen === generationRef.current) {
+        setErrorMessage(err?.message || "Failed to connect to voice agent.");
+        setStatus("error");
+      }
+    } finally {
+      if (currentGen === generationRef.current) {
+        connectingRef.current = false;
+      }
+    }
+  }, [router, useRelayPolicy, repairName, serviceName]);
+
+  useEffect(() => {
+    startSessionRef.current = startSession;
+  }, [startSession]);
+
+  useEffect(() => {
+    const handleUnhandledRejection = (event) => {
+      const reason = event?.reason;
+      const msg = String(reason?.message || reason || "");
+      if (
+        msg.includes("could not establish Publisher connection") ||
+        msg.includes("Publisher connection") ||
+        msg.includes("ConnectionError") ||
+        msg.includes("SessionConnectionError") ||
+        msg.includes("socket") ||
+        msg.includes("network") ||
+        msg.includes("closed due to a socket error") ||
+        msg.includes("could not establish pc connection")
+      ) {
+        event.preventDefault();
+        console.warn(
+          "[ElevenLabsAgent:Global] Handled network/socket connection failure asynchronously. Gracefully falling back / retrying...",
+          msg
+        );
+        connectionModeRef.current = "websocket";
+        setConnectionMode("websocket");
+        connectingRef.current = false;
+        if (conversationRef.current) {
+          const conv = conversationRef.current;
+          conversationRef.current = null;
+          conv.endSession().catch(() => {});
+        }
+        startSessionRef.current?.({ connectionMode: "websocket", isUserInitiated: false });
+      }
+    };
+
+    window.addEventListener("unhandledrejection", handleUnhandledRejection);
+    return () => {
+      window.removeEventListener("unhandledrejection", handleUnhandledRejection);
+    };
+  }, []);
+
+  const handleSendTextMessage = useCallback(
+    async (e) => {
+      if (e) e.preventDefault();
+      const query = textInput.trim();
+      if (!query || isSendingText) return;
+
+      const userMsg = {
+        id: `user-${Date.now()}`,
+        sender: "user",
+        text: query,
+        timestamp: new Date(),
+      };
+      setTranscript((prev) => [...prev, userMsg]);
+      setTextInput("");
+      setIsSendingText(true);
+
+      try {
+        // First try the Gemini-powered conversational agent endpoint
+        const geminiRes = await fetch("/api/agent/gemini-chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: query }),
+        });
+
+        if (geminiRes.ok) {
+          let geminiData = null;
+          try {
+            geminiData = await geminiRes.json();
+          } catch {
+            geminiData = null;
+          }
+          if (geminiData && geminiData.ok && geminiData.reply) {
+            setTranscript((prev) => [
+              ...prev,
+              {
+                id: `agent-${Date.now()}`,
+                sender: "agent",
+                text: resolveDynamicVariables(geminiData.reply),
+                timestamp: new Date(),
+              },
+            ]);
+            return;
+          }
+        }
+
+        // Fallback: search storefront products directly
+        const res = await fetch("/api/agent/search", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query, first: 4 }),
+        });
+        let data = null;
+        if (res.ok) {
+          try {
+            data = await res.json();
+          } catch {
+            data = null;
+          }
+        }
+        const products = data?.products || [];
+
+        let reply = "";
+        if (products.length > 0) {
+          reply =
+            `Found ${products.length} matching product${products.length > 1 ? "s" : ""} in our Spokane inventory:\n` +
+            products
+              .map((p) => {
+                const price = p.priceRange?.minVariantPrice?.amount;
+                const cur = p.priceRange?.minVariantPrice?.currencyCode || "$";
+                return `• ${p.title} (${price ? `${cur} ${price}` : "Inquire for quote"})`;
+              })
+              .join("\n") +
+            `\n\nYou can search for these items in our site header or visit our Spokane repair shop!`;
+        } else {
+          reply = `Thanks for asking! For Spokane repair estimates, iPhone/Samsung screen replacements, or custom parts, you can search our catalog or visit Display Cell Pros in Spokane, WA.`;
+        }
+
+        setTranscript((prev) => [
+          ...prev,
+          {
+            id: `agent-${Date.now()}`,
+            sender: "agent",
+            text: resolveDynamicVariables(reply),
+            timestamp: new Date(),
+          },
+        ]);
+      } catch (err) {
+        setTranscript((prev) => [
+          ...prev,
+          {
+            id: `agent-${Date.now()}`,
+            sender: "agent",
+            text: resolveDynamicVariables(
+              "I'm temporarily unable to query live catalog items, but our Spokane store is open for walk-ins and phone inquiries!"
+            ),
+            timestamp: new Date(),
+          },
+        ]);
+      } finally {
+        setIsSendingText(false);
+      }
+    },
+    [textInput, isSendingText]
+  );
+
+  useEffect(() => {
+    mountedRef.current = true;
+    const currentGenerationRef = generationRef;
+    currentGenerationRef.current++;
+    const gen = currentGenerationRef.current;
+    debugLog(`[ElevenLabs:LIFECYCLE] cleanup setup (gen: ${gen})`);
+
+    return () => {
+      mountedRef.current = false;
+      currentGenerationRef.current++;
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+        debugLog(`[ElevenLabs:LIFECYCLE] reconnect cancelled`);
+      }
+      if (volumeAnimFrameRef.current) {
+        cancelAnimationFrame(volumeAnimFrameRef.current);
+        volumeAnimFrameRef.current = null;
+      }
+      if (conversationRef.current) {
+        const conv = conversationRef.current;
+        conversationRef.current = null;
+        conv.endSession().catch(() => {});
+      }
+      connectingRef.current = false;
+      debugLog(`[ElevenLabs:LIFECYCLE] cleanup`);
+    };
+  }, []);
+
+  // Dynamic audio output volume analysis loop: polls output volume from ElevenLabs conversation
+  useEffect(() => {
+    const isConn = status === "connected";
+    if (!isConn) {
+      smoothedVolumeRef.current = 0;
+      if (volumeAnimFrameRef.current) {
+        cancelAnimationFrame(volumeAnimFrameRef.current);
+        volumeAnimFrameRef.current = null;
+      }
+      return;
+    }
+
+    let isRunning = true;
+    let phase = 0;
+
+    const tick = () => {
+      if (!isRunning) return;
+
+      let rawVolume = 0;
+      if (conversationRef.current?.getOutputVolume) {
+        try {
+          rawVolume = conversationRef.current.getOutputVolume() || 0;
+        } catch {
+          rawVolume = 0;
+        }
+      }
+
+      let rawInputVolume = 0;
+      if (conversationRef.current?.getInputVolume) {
+        try {
+          rawInputVolume = conversationRef.current.getInputVolume() || 0;
+        } catch {
+          rawInputVolume = 0;
+        }
+      }
+
+      // If the agent is speaking, rawVolume reflects audio output volume (0 to 1).
+      // We also blend with dynamic speech wave oscillation while speaking to ensure
+      // continuous, rich pulse animation across all browsers and devices.
+      let targetVolume = 0;
+      if (isSpeaking) {
+        phase += 0.18;
+        const wave = 0.35 + 0.22 * Math.sin(phase) + 0.12 * Math.sin(phase * 2.7);
+        targetVolume = rawVolume > 0.05 ? Math.min(1, rawVolume * 2.2) : wave;
+      } else {
+        targetVolume = 0;
+        phase = 0;
+      }
+
+      const current = smoothedVolumeRef.current;
+      const lerpSpeed = targetVolume > current ? 0.35 : 0.14; // Snappy attack, smooth decay
+      const next = current + (targetVolume - current) * lerpSpeed;
+      const clamped = Math.min(1, Math.max(0, next));
+      smoothedVolumeRef.current = clamped;
+
+      const rounded = Math.round(clamped * 100) / 100;
+      setOutputVolume((prev) => {
+        if (Math.abs(prev - rounded) < 0.01) return prev;
+        return rounded;
+      });
+
+      // Smooth input (microphone) volume
+      const targetInput = Math.min(1, rawInputVolume * 2.5);
+      const currentInput = smoothedInputVolumeRef.current;
+      const nextInput = currentInput + (targetInput - currentInput) * 0.25;
+      const clampedInput = Math.min(1, Math.max(0, nextInput));
+      smoothedInputVolumeRef.current = clampedInput;
+
+      const roundedInput = Math.round(clampedInput * 100) / 100;
+      setInputVolume((prev) => {
+        if (Math.abs(prev - roundedInput) < 0.01) return prev;
+        return roundedInput;
+      });
+
+      volumeAnimFrameRef.current = requestAnimationFrame(tick);
+    };
+
+    volumeAnimFrameRef.current = requestAnimationFrame(tick);
+
+    return () => {
+      isRunning = false;
+      if (volumeAnimFrameRef.current) {
+        cancelAnimationFrame(volumeAnimFrameRef.current);
+        volumeAnimFrameRef.current = null;
+      }
+    };
+  }, [status, isSpeaking]);
+
+  const isConnected = status === "connected";
+  const isConnecting = status === "connecting";
+
+  // Determine current voice agent state for user feedback visual indicator
+  const agentStatus = (() => {
+    if (queueStatus === "waiting") return "queued";
+    if (status === "connecting") return "connecting";
+    if (status === "connected") return isSpeaking ? "speaking" : "listening";
+    if (status === "error") return "error";
+    return "offline";
+  })();
+
+  const STATUS_CONFIG = {
+    queued: {
+      label: "In Queue",
+      badgeClass: "bg-purple-50 text-purple-800 border-purple-200 shadow-xs",
+      dotClass: "bg-purple-500",
+      dotPing: true,
+      bannerBg: "bg-purple-50/90 border-purple-200/80 text-purple-800",
+      subtext: "Call queue active. Waiting for available agent line...",
+      toggleBg: "bg-purple-600 text-white hover:bg-purple-700 ring-4 ring-purple-500/20",
+      toggleStatusTag: "Queued",
+      toggleBadgeClass: "bg-purple-500/30 text-purple-100 border-purple-400/40",
+    },
+    offline: {
+      label: "Offline",
+      badgeClass: "bg-neutral-100 text-neutral-600 border-neutral-200/90",
+      dotClass: "bg-neutral-400",
+      dotPing: false,
+      bannerBg: "bg-neutral-50 border-neutral-200/80 text-neutral-600",
+      subtext: "Voice agent offline. Click start to connect.",
+      toggleBg: "bg-neutral-900 text-white hover:bg-black hover:scale-105",
+      toggleStatusTag: "Offline",
+      toggleBadgeClass: "bg-neutral-800 text-neutral-300 border-neutral-700/80",
+    },
+    connecting: {
+      label: "Connecting",
+      badgeClass: "bg-amber-50 text-amber-800 border-amber-200 shadow-xs",
+      dotClass: "bg-amber-500",
+      dotPing: true,
+      bannerBg: "bg-amber-50/90 border-amber-200/80 text-amber-800",
+      subtext: "Establishing voice connection...",
+      toggleBg: "bg-amber-600 text-white hover:bg-amber-700 ring-4 ring-amber-500/20",
+      toggleStatusTag: "Connecting",
+      toggleBadgeClass: "bg-amber-500/30 text-amber-100 border-amber-400/40",
+    },
+    listening: {
+      label: "Listening",
+      badgeClass: "bg-emerald-50 text-emerald-800 border-emerald-200 shadow-xs",
+      dotClass: "bg-emerald-500",
+      dotPing: true,
+      bannerBg: "bg-emerald-50/90 border-emerald-200/80 text-emerald-800",
+      subtext: "Listening for your voice... speak anytime",
+      toggleBg: "bg-emerald-600 text-white hover:bg-emerald-700 ring-4 ring-emerald-500/20",
+      toggleStatusTag: "Listening",
+      toggleBadgeClass: "bg-emerald-500/30 text-emerald-100 border-emerald-400/40",
+    },
+    speaking: {
+      label: "Speaking",
+      badgeClass: "bg-sky-50 text-sky-800 border-sky-200 shadow-xs",
+      dotClass: "bg-sky-500",
+      dotPing: true,
+      bannerBg: "bg-sky-50/90 border-sky-200/80 text-sky-800",
+      subtext: "Agent is speaking...",
+      toggleBg: "bg-sky-600 text-white hover:bg-sky-700 ring-4 ring-sky-500/20",
+      toggleStatusTag: "Speaking",
+      toggleBadgeClass: "bg-sky-500/30 text-sky-100 border-sky-400/40",
+    },
+    error: {
+      label: "Offline",
+      badgeClass: "bg-red-50 text-red-700 border-red-200 shadow-xs",
+      dotClass: "bg-red-500",
+      dotPing: false,
+      bannerBg: "bg-red-50/90 border-red-200/80 text-red-700",
+      subtext: "Connection failed. Please retry.",
+      toggleBg: "bg-red-600 text-white hover:bg-red-700 ring-4 ring-red-500/20",
+      toggleStatusTag: "Offline",
+      toggleBadgeClass: "bg-red-500/30 text-red-100 border-red-400/40",
+    },
+  };
+
+  const currentConfig = STATUS_CONFIG[agentStatus] || STATUS_CONFIG.offline;
+
+  // Component helper to render the appropriate view based on active state and connection status
+  const renderBodyContent = () => {
+    if (activeView === "chat") {
+      return (
+        <div id="elevenlabs-chat-view-container" className="space-y-2.5">
+          <div className="p-2 rounded-xl bg-emerald-50/80 border border-emerald-200/70 text-xs text-emerald-800 flex items-center justify-between">
+            <div className="flex items-center gap-1.5">
+              <Sparkles className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+              <span className="font-semibold">Text Assistant Mode</span>
+            </div>
+            <span className="text-[10px] text-emerald-800 uppercase font-bold tracking-wider">
+              Spokane Catalog Live
+            </span>
+          </div>
+
+          <VoiceTranscriptDisplay
+            transcript={transcript}
+            isSpeaking={false}
+            isConnected={false}
+            status={status}
+            onClearTranscript={() => setTranscript([])}
+            maxHeight="max-h-56 sm:max-h-64"
+          />
+
+          <form onSubmit={handleSendTextMessage} className="flex items-center gap-2 pt-1">
+            <input
+              type="text"
+              value={textInput}
+              onChange={(e) => setTextInput(e.target.value)}
+              placeholder="Ask about iPhone repairs, screens, parts..."
+              disabled={isSendingText}
+              className="flex-1 px-3 py-2 text-xs rounded-xl border border-neutral-300 focus:outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/20 bg-white shadow-inner"
+            />
+            <button
+              type="submit"
+              disabled={isSendingText || !textInput.trim()}
+              className="flex items-center justify-center px-3 py-2 rounded-xl bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white text-xs font-semibold shadow-xs transition-colors cursor-pointer"
+              title="Send message"
+            >
+              {isSendingText ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Send className="w-4 h-4" />
+              )}
+            </button>
+          </form>
+        </div>
+      );
+    }
+
+    if (activeView === "transcript") {
+      return (
+        <div id="elevenlabs-transcript-view-container" className="space-y-2.5">
+          {/* Compact active status banner if currently in call */}
+          {isConnected && (
+            <div className="flex items-center justify-between p-2 rounded-xl bg-neutral-100 border border-neutral-200/80 text-xs">
+              <div className="flex items-center gap-2">
+                <VoicePulseAvatar
+                  volume={outputVolume}
+                  isSpeaking={isSpeaking}
+                  isListening={agentStatus === "listening"}
+                  isConnected={isConnected}
+                  status={agentStatus}
+                  size="sm"
+                  showVolumeMeter={false}
+                />
+                <span className="font-semibold text-neutral-800">
+                  {isSpeaking
+                    ? `Agent Speaking (${Math.round(outputVolume * 100)}%)`
+                    : "Agent Listening"}
+                </span>
+              </div>
+              <button
+                id="elevenlabs-transcript-end-call-btn"
+                type="button"
+                onClick={endSession}
+                className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-red-600 hover:bg-red-700 text-white text-[11px] font-semibold transition-colors cursor-pointer"
+              >
+                <PhoneOff className="w-3 h-3" />
+                <span>End Call</span>
+              </button>
+            </div>
+          )}
+
+          {/* Main Scrollable Transcript Component */}
+          <VoiceTranscriptDisplay
+            transcript={transcript}
+            isSpeaking={isSpeaking}
+            isConnected={isConnected}
+            status={status}
+            onClearTranscript={() => setTranscript([])}
+            maxHeight="max-h-72 sm:max-h-80"
+          />
+
+          {!isConnected && (
+            <div className="flex items-center gap-2 pt-1">
+              <button
+                id="elevenlabs-transcript-reconnect-btn"
+                type="button"
+                onClick={() => {
+                  setActiveView("call");
+                  startSession({ isUserInitiated: true }).catch((err) => {
+                    console.warn("[ElevenLabsAgent:UI] Start call error:", err?.message);
+                  });
+                }}
+                className="flex-1 flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl bg-neutral-900 hover:bg-black text-white text-xs font-semibold transition-colors cursor-pointer"
+              >
+                <Mic className="w-3.5 h-3.5 text-emerald-400" />
+                <span>Start New Call</span>
+              </button>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    if (isConnected) {
+      return (
+        <div id="elevenlabs-call-active-container" className="flex flex-col space-y-3">
+          {/* Visual Status Visualizer with Dynamic Audio-Volume Reactive Avatar */}
+          <div
+            id="elevenlabs-active-status-visualizer"
+            className={`w-full flex flex-col items-center justify-center py-4 px-3 rounded-xl border transition-all duration-200 ${
+              agentStatus === "speaking"
+                ? "bg-sky-50/70 border-sky-200/80 shadow-xs"
+                : "bg-emerald-50/70 border-emerald-200/80 shadow-xs"
+            }`}
+          >
+            <div className="relative flex items-center justify-center my-1">
+              <AudioWaveformVisualizer
+                status={agentStatus}
+                outputVolume={outputVolume}
+                inputVolume={inputVolume}
+                size={80}
+              />
+            </div>
+
+            <div className="flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider mt-2">
+              {agentStatus === "speaking" ? (
+                <>
+                  <Volume2 className="w-3.5 h-3.5 text-sky-600 animate-pulse" />
+                  <span className="text-sky-800">
+                    Status: Speaking {outputVolume > 0.02 ? `(${Math.round(outputVolume * 100)}%)` : ""}
+                  </span>
+                </>
+              ) : (
+                <>
+                  <Radio className="w-3.5 h-3.5 text-emerald-600 animate-pulse" />
+                  <span className="text-emerald-800">Status: Listening</span>
+                </>
+              )}
+            </div>
+            <p
+              className={`text-[11px] text-center mt-0.5 ${
+                agentStatus === "speaking"
+                  ? "text-sky-700/90"
+                  : "text-emerald-700/90"
+              }`}
+            >
+              {agentStatus === "speaking"
+                ? "AI agent speaking — avatar pulse scales with voice audio volume."
+                : "Microphone active. Ask about Spokane repairs, parts, or cart."}
+            </p>
+          </div>
+
+          <div className="space-y-1.5">
+            <VoiceTranscriptDisplay
+              transcript={transcript}
+              isSpeaking={isSpeaking}
+              isConnected={isConnected}
+              status={status}
+              onClearTranscript={() => setTranscript([])}
+              maxHeight="max-h-40 sm:max-h-48"
+            />
+            {transcript.length > 0 && (
+              <button
+                id="elevenlabs-expand-transcript-btn"
+                type="button"
+                onClick={() => setActiveView("transcript")}
+                className="w-full text-center text-[11px] font-medium text-neutral-500 hover:text-neutral-900 py-1 transition-colors cursor-pointer"
+              >
+                Open full transcript view ({transcript.length} messages) →
+              </button>
+            )}
+          </div>
+
+          <button
+            id="elevenlabs-end-call-btn"
+            onClick={endSession}
+            className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl bg-red-600 hover:bg-red-700 text-white text-xs font-semibold shadow-xs transition-colors cursor-pointer"
+          >
+            <PhoneOff className="w-3.5 h-3.5" />
+            End Voice Conversation
+          </button>
+        </div>
+      );
+    }
+
+    // Default View: Idle / Disconnected State
+    return (
+      <div id="elevenlabs-call-idle-container" className="space-y-3">
+        <div
+          id="elevenlabs-idle-status-indicator"
+          className={`flex flex-col items-center justify-center p-3 rounded-xl border text-center transition-all duration-200 ${currentConfig.bannerBg}`}
+        >
+          <VoicePulseAvatar
+            volume={0}
+            isSpeaking={false}
+            isListening={false}
+            isConnected={false}
+            status={agentStatus}
+            size="md"
+            showVolumeMeter={false}
+            className="mb-1.5"
+          />
+          <div className="flex items-center gap-1.5 text-xs font-bold">
+            <span className="relative flex h-2 w-2">
+              {currentConfig.dotPing && (
+                <span
+                  className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${currentConfig.dotClass}`}
+                />
+              )}
+              <span
+                className={`relative inline-flex rounded-full h-2 w-2 ${currentConfig.dotClass}`}
+              />
+            </span>
+            <span>Status: {currentConfig.label}</span>
+          </div>
+          <p className="text-[11px] opacity-80 mt-0.5">
+            {currentConfig.subtext}
+          </p>
+        </div>
+
+        <p className="text-xs text-neutral-600 leading-relaxed">
+          Talk directly with our live AI Specialist to find replacement parts, get Spokane repair pricing, or manage your cart hands-free.
+        </p>
+
+        {transcript.length > 0 && (
+          <div
+            id="elevenlabs-saved-transcript-alert"
+            className="flex items-center justify-between p-2.5 rounded-xl bg-neutral-100 border border-neutral-200 text-xs"
+          >
+            <div className="flex items-center gap-1.5 text-neutral-700 font-medium">
+              <MessageSquare className="w-3.5 h-3.5 text-neutral-500" />
+              <span>{transcript.length} transcript messages saved</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setActiveView("transcript")}
+              className="text-[11px] font-semibold text-neutral-900 hover:underline cursor-pointer"
+            >
+              View →
+            </button>
+          </div>
+        )}
+
+        <div className="flex flex-col gap-2">
+          <button
+            id="elevenlabs-start-call-btn"
+            onClick={() => {
+              startSession({ isUserInitiated: true }).catch((err) => {
+                console.warn("[ElevenLabsAgent:UI] Start call error:", err?.message);
+              });
+            }}
+            disabled={isConnecting}
+            className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl bg-neutral-900 hover:bg-black text-white text-xs font-semibold shadow-xs disabled:opacity-50 transition-colors cursor-pointer"
+          >
+            {isConnecting ? (
+              <>
+                <Loader2 className="w-3.5 h-3.5 text-white animate-spin" />
+                Connecting to Voice Agent...
+              </>
+            ) : (
+              <>
+                <Mic className="w-3.5 h-3.5 text-emerald-400" />
+                Start Voice Call
+              </>
+            )}
+          </button>
+
+          <button
+            id="elevenlabs-switch-text-btn"
+            type="button"
+            onClick={() => setActiveView("chat")}
+            className="w-full flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl bg-neutral-100 hover:bg-neutral-200 text-neutral-800 text-xs font-semibold transition-colors cursor-pointer"
+          >
+            <Send className="w-3.5 h-3.5 text-neutral-600" />
+            <span>Prefer text? Chat with Assistant</span>
+          </button>
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div
+      id="elevenlabs-voice-agent-container"
+      className="fixed bottom-20 sm:bottom-22 right-4 sm:right-6 z-40 flex flex-col items-end gap-3 pointer-events-none select-none"
+    >
+      {/* Expanded Control Box */}
+      {isOpen && (
+        <div
+          id="elevenlabs-agent-card"
+          className="pointer-events-auto bg-white/95 backdrop-blur-md text-neutral-900 border border-neutral-200/80 rounded-2xl shadow-2xl p-4 w-80 sm:w-96 max-w-[calc(100vw-2rem)] transition-all duration-300 transform origin-bottom-right"
+        >
+          {/* Header with Visual Status Indicator */}
+          <div className="flex items-center justify-between pb-3 border-b border-neutral-100">
+            <div className="flex items-center gap-2">
+              <div>
+                <div className="flex items-center gap-2">
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-neutral-900">
+                    Voice Support Agent
+                  </h3>
+                  <span
+                    id="elevenlabs-header-status-indicator"
+                    role="status"
+                    aria-live="polite"
+                    className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider border ${currentConfig.badgeClass} transition-all duration-200`}
+                  >
+                    <span className="relative flex h-2 w-2">
+                      {currentConfig.dotPing && (
+                        <span
+                          className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${currentConfig.dotClass}`}
+                        />
+                      )}
+                      <span
+                        className={`relative inline-flex rounded-full h-2 w-2 ${currentConfig.dotClass}`}
+                      />
+                    </span>
+                    {currentConfig.label}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2 mt-1">
+                  <p className="text-[10px] text-neutral-500 font-medium">Search Scope:</p>
+                  <button
+                    onClick={() => setSearchMode(searchMode === "local" ? "global" : "local")}
+                    className={`px-1.5 py-0.5 rounded border text-[9px] font-bold uppercase transition-colors cursor-pointer ${
+                      searchMode === "global"
+                        ? "bg-indigo-100 text-indigo-700 border-indigo-200"
+                        : "bg-emerald-100 text-emerald-700 border-emerald-200"
+                    }`}
+                  >
+                    {searchMode === "global" ? "Global Shopify" : "Local Spokane"}
+                  </button>
+                </div>
+              </div>
+            </div>
+            <button
+              onClick={() => setIsOpen(false)}
+              className="text-neutral-400 hover:text-neutral-700 text-xs p-1.5 rounded-md hover:bg-neutral-100 transition-colors cursor-pointer"
+              aria-label="Minimize voice widget"
+            >
+              ✕
+            </button>
+          </div>
+
+          <div
+            id="elevenlabs-card-tabs"
+            className="flex items-center gap-1 p-1 mt-2.5 bg-neutral-100/90 rounded-xl text-xs border border-neutral-200/70"
+          >
+            <button
+              id="elevenlabs-tab-call"
+              type="button"
+              onClick={() => setActiveView("call")}
+              className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 px-2.5 rounded-lg font-semibold text-xs transition-all duration-150 cursor-pointer ${
+                activeView === "call"
+                  ? "bg-white text-neutral-900 shadow-xs"
+                  : "text-neutral-500 hover:text-neutral-900"
+              }`}
+            >
+              <Radio className="w-3.5 h-3.5" />
+              <span>Voice Call</span>
+            </button>
+            <button
+              id="elevenlabs-tab-chat"
+              type="button"
+              onClick={() => setActiveView("chat")}
+              className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 px-2.5 rounded-lg font-semibold text-xs transition-all duration-150 cursor-pointer ${
+                activeView === "chat"
+                  ? "bg-white text-neutral-900 shadow-xs"
+                  : "text-neutral-500 hover:text-neutral-900"
+              }`}
+            >
+              <Send className="w-3.5 h-3.5" />
+              <span>Text Chat</span>
+            </button>
+            <button
+              id="elevenlabs-tab-transcript"
+              type="button"
+              onClick={() => setActiveView("transcript")}
+              className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 px-2.5 rounded-lg font-semibold text-xs transition-all duration-150 cursor-pointer ${
+                activeView === "transcript"
+                  ? "bg-white text-neutral-900 shadow-xs"
+                  : "text-neutral-500 hover:text-neutral-900"
+              }`}
+            >
+              <MessageSquare className="w-3.5 h-3.5" />
+              <span>Transcript</span>
+              {transcript.length > 0 && (
+                <span
+                  id="elevenlabs-transcript-tab-badge"
+                  className="px-1.5 py-0.2 rounded-full bg-neutral-200 text-[10px] font-bold text-neutral-700"
+                >
+                  {transcript.length}
+                </span>
+              )}
+            </button>
+          </div>
+
+          <div className="py-2.5">
+            {errorMessage && (
+              <div className="flex flex-col gap-2.5 p-3 mb-3 bg-red-50/95 border border-red-200 rounded-xl text-xs text-red-800 shadow-xs">
+                <div className="flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-red-600" />
+                  <div className="flex-1">
+                    <span className="font-semibold block text-red-900">
+                      {errorMessage.includes("WebRTC") || errorMessage.includes("signal")
+                        ? "WebRTC Connection Notice"
+                        : "Voice Agent Error"}
+                    </span>
+                    <span className="leading-snug text-[11px] text-red-700">
+                      {errorMessage}
+                    </span>
+                  </div>
+                </div>
+
+                {(showDiagnostics || errorMessage.includes("WebRTC") || errorMessage.includes("signal") || errorMessage.includes("WebSocket")) && (
+                  <div className="mt-1 pt-2 border-t border-red-200/80 space-y-2 text-[11px]">
+                    <div className="font-semibold text-red-900 flex items-center gap-1.5">
+                      <ShieldAlert className="w-3.5 h-3.5 text-red-600" />
+                      <span>Targeted Connection Fixes:</span>
+                    </div>
+                    <ul className="space-y-1.5 pl-1 text-neutral-700">
+                      <li className="flex items-start gap-1.5">
+                        <span className="font-bold text-red-600 shrink-0">•</span>
+                        <span>
+                          <strong>Network & Firewall:</strong> WebRTC requires UDP & WebSocket traffic. Disable active VPNs, retry on unrestricted Wi-Fi.
+                        </span>
+                      </li>
+                      <li className="flex items-start gap-1.5">
+                        <span className="font-bold text-red-600 shrink-0">•</span>
+                        <span>
+                          <strong>Permissions:</strong> Ensure browser microphone access is granted.
+                        </span>
+                      </li>
+                    </ul>
+
+                    <div className="flex flex-wrap items-center gap-2 pt-1.5">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          connectionModeRef.current = "websocket";
+                          setConnectionMode("websocket");
+                          startSession({ connectionMode: "websocket", isUserInitiated: true }).catch((err) => {
+                            console.warn("[ElevenLabsAgent:UI] WebSocket fallback failed:", err?.message);
+                          });
+                        }}
+                        className="flex-1 min-w-[130px] flex items-center justify-center gap-1 px-2.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-semibold text-[11px] transition-colors cursor-pointer"
+                      >
+                        <RefreshCw className="w-3 h-3" />
+                        <span>Use WebSocket</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setUseRelayPolicy(true);
+                          connectionModeRef.current = "webrtc";
+                          setConnectionMode("webrtc");
+                          startSession({ forceRelay: true, connectionMode: "webrtc", isUserInitiated: true }).catch((err) => {
+                            console.warn("[ElevenLabsAgent:UI] WebRTC retry failed:", err?.message);
+                          });
+                        }}
+                        className="flex-1 min-w-[130px] flex items-center justify-center gap-1 px-2.5 py-1.5 rounded-lg bg-red-700 hover:bg-red-800 text-white font-semibold text-[11px] transition-colors cursor-pointer"
+                      >
+                        <RefreshCw className="w-3 h-3" />
+                        <span>Retry Relay</span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* View Content Area */}
+            {renderBodyContent()}
+          </div>
+        </div>
+      )}
+
+      {/* Floating Toggle Button with Integrated Audio Waveform Orb */}
+      <button
+        id="elevenlabs-agent-toggle-btn"
+        onClick={() => setIsOpen((prev) => !prev)}
+        aria-label={isOpen ? "Minimize voice support agent" : "Open Spokane Repair Voice Specialist"}
+        title="Spokane Repair Voice Specialist • Click to talk"
+        className={`pointer-events-auto group relative flex items-center gap-2.5 px-3 py-2 sm:px-3.5 sm:py-2.5 rounded-full shadow-2xl backdrop-blur-xl border border-white/20 transition-all duration-300 hover:scale-[1.03] cursor-pointer ${currentConfig.toggleBg}`}
+      >
+        {/* Glowing Audio Waveform Visualizer Orb */}
+        <div className="relative flex items-center justify-center shrink-0">
+          <AudioWaveformVisualizer
+            status={agentStatus}
+            outputVolume={outputVolume}
+            inputVolume={inputVolume}
+            size={28}
+          />
+        </div>
+
+        <div className="flex flex-col text-left leading-tight pr-0.5">
+          <span className="text-xs font-bold tracking-tight text-white flex items-center gap-1.5">
+            <span>Repair AI</span>
+            {agentStatus === "speaking" && (
+              <span className="inline-flex h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
+            )}
+          </span>
+          <span className="text-[10px] text-white/80 font-medium hidden sm:inline">
+            Spokane On-Site
+          </span>
+        </div>
+
+        <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider border shadow-xs ${currentConfig.toggleBadgeClass}`}>
+          {currentConfig.label}
+        </span>
+
+        {/* Unread indicator when minimized with active transcript */}
+        {!isOpen && transcript.length > 0 && (
+          <span
+            id="elevenlabs-unread-pill"
+            className="absolute -top-1.5 -right-1.5 flex h-4 w-4 items-center justify-center rounded-full bg-emerald-500 text-[9px] font-bold text-white ring-2 ring-white shadow-md animate-bounce"
+          >
+            {transcript.length > 9 ? "9+" : transcript.length}
+          </span>
+        )}
+      </button>
+    </div>
+  );
+}

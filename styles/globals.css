@@ -1,0 +1,230 @@
+@import "tailwindcss";
+
+@theme {
+  --color-canvas: #faf9f5;
+  --color-surface: #ffffff;
+  --color-surface-muted: #f3f1ea;
+  --color-border-subtle: #e7e5df;
+  --color-border-strong: #d2cfc7;
+
+  --color-ink-950: #0f1013;
+  --color-ink-900: #141518;
+  --color-ink-800: #24262b;
+  --color-ink-700: #3c3f46;
+  --color-ink-600: #585c66;
+  --color-ink-500: #747985;
+  --color-ink-400: #7a7f87;
+  --color-ink-300: #c5c8d1;
+
+  --color-primary-50: #fff5f2;
+  --color-primary-100: #ffe8e2;
+  --color-primary-200: #ffd3c7;
+  --color-primary-300: #ffae9b;
+  --color-primary-400: #ff7f62;
+  --color-primary-500: #e05332;
+  --color-primary-600: #c84223;
+  --color-primary-700: #a73318;
+  --color-primary-800: #872915;
+  --color-primary-900: #6f2515;
+  --color-primary-950: #3c0f05;
+
+  --color-secondary-50: #f0fdfa;
+  --color-secondary-100: #ccfbf1;
+  --color-secondary-200: #99f6e4;
+  --color-secondary-300: #5eead4;
+  --color-secondary-400: #2dd4bf;
+  --color-secondary-500: #0d9488;
+  --color-secondary-600: #0f766e;
+  --color-secondary-700: #115e59;
+  --color-secondary-800: #134e4a;
+  --color-secondary-900: #133e3b;
+  --color-secondary-950: #042f2e;
+
+  --color-brass-500: #d97706;
+  --color-brass-600: #b45309;
+  --color-brass-700: #92400e;
+
+  --font-serif: "Iowan Old Style", "Apple Garamond", "Baskerville", "Palatino Linotype", "Palatino", "Book Antiqua", "Georgia", serif;
+}
+
+body {
+  background-color: #faf9f5;
+  color: #141518;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  transition-duration: 200ms;
+  transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Cumulative Layout Shift (CLS) Global Mitigation */
+img {
+  max-width: 100%;
+  height: auto;
+}
+
+/* Preserve aspect ratios on image containers and prevent 0x0 initial bounding boxes */
+img[loading="lazy"] {
+  content-visibility: auto;
+}
+
+.aspect-square,
+[data-aspect-ratio="1/1"],
+.img-aspect-square {
+  aspect-ratio: 1 / 1;
+}
+
+.aspect-video,
+[data-aspect-ratio="16/9"],
+.img-aspect-video {
+  aspect-ratio: 16 / 9;
+}
+
+/* Fallback for Next.js image wrappers without predefined layout */
+span[style*="box-sizing: border-box"][style*="display: block"] > img,
+span[style*="box-sizing:border-box"][style*="display:block"] > img {
+  aspect-ratio: auto;
+}
+
+h1, h2, h3, h4, h5, h6,
+.font-serif,
+.font-display {
+  font-family: "Iowan Old Style", "Apple Garamond", "Baskerville", "Palatino Linotype", "Palatino", "Book Antiqua", "Georgia", serif;
+  letter-spacing: -0.015em;
+}
+
+button, input, select, textarea, .font-sans {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.animate-shimmer {
+  background: linear-gradient(
+    90deg,
+    rgba(243, 244, 246, 0.9) 0%,
+    rgba(255, 255, 255, 0.95) 50%,
+    rgba(243, 244, 246, 0.9) 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.8s infinite linear;
+}
+
+.animate-shimmer-subtle {
+  background: linear-gradient(
+    90deg,
+    rgba(229, 231, 235, 0.7) 0%,
+    rgba(243, 244, 246, 1) 50%,
+    rgba(229, 231, 235, 0.7) 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 2s infinite linear;
+}
+
+@keyframes gridEntranceFadeIn {
+  0% {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes shrinkWidth {
+  0% {
+    width: 100%;
+  }
+  100% {
+    width: 0%;
+  }
+}
+
+@keyframes slideInRight {
+  0% {
+    transform: translateX(100%);
+  }
+  100% {
+    transform: translateX(0);
+  }
+}
+
+@keyframes fadeIn {
+  0% {
+    opacity: 0;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
+@keyframes scaleIn {
+  0% {
+    opacity: 0;
+    transform: scale(0.85);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.animate-slide-in-right {
+  animation: slideInRight 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.2s ease-out forwards;
+}
+
+.animate-scaleIn {
+  animation: scaleIn 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-grid-fade-in {
+  animation: gridEntranceFadeIn 0.45s cubic-bezier(0.16, 1, 0.3, 1) backwards;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-grid-fade-in {
+    animation: none;
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* NProgress Top-of-page Loading Bar */
+#nprogress {
+  pointer-events: none;
+}
+
+#nprogress .bar {
+  background: linear-gradient(90deg, #ea580c 0%, #e05332 50%, #f97316 100%);
+  position: fixed;
+  z-index: 99999;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 3px;
+  box-shadow: 0 0 10px rgba(224, 83, 50, 0.4);
+}
+
+#nprogress .peg {
+  display: block;
+  position: absolute;
+  right: 0px;
+  width: 100px;
+  height: 100%;
+  box-shadow: 0 0 12px #e05332, 0 0 6px #ea580c;
+  opacity: 1;
+  transform: rotate(3deg) translate(0px, -4px);
+}
+

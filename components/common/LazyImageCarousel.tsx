@@ -1,0 +1,116 @@
+import { jsx, IconButton } from 'theme-ui'
+import { FC } from 'react'
+import {
+  CarouselProvider,
+  ImageWithZoom,
+  Slide,
+  Slider,
+  Dot,
+} from 'pure-react-carousel'
+import Image from 'next/image'
+import { PRODUCT_IMAGE_BLUR_DATA_URL, RESPONSIVE_IMAGE_SIZES } from '@lib/image'
+
+import 'pure-react-carousel/dist/react-carousel.es.css'
+
+const CustomDotGroup: FC<Omit<ImageCarouselProps, 'alt'>> = ({
+  images,
+  onThumbnailClick,
+  ...imageProps
+}) => {
+  return (
+    <div
+      sx={{
+        textAlign: 'center',
+        position: 'absolute',
+        left: '50%',
+        maxWidth: '100%',
+        overflow: 'auto',
+        display: 'flex',
+        bottom: 10,
+        transform: 'translatex(-50%)',
+      }}
+    >
+      {images.map((image, slide) => (
+        <IconButton
+          key={slide}
+          sx={{ height: 80, width: 80 }}
+          as="span"
+          onClick={() => onThumbnailClick?.(slide)}
+        >
+          <Dot slide={slide}>
+            <Image
+              alt="dot"
+              src={image.src}
+              placeholder="blur"
+              blurDataURL={PRODUCT_IMAGE_BLUR_DATA_URL}
+              {...imageProps}
+              height={80}
+              width={80}
+              sizes="80px"
+              loading="lazy"
+            ></Image>
+          </Dot>
+        </IconButton>
+      ))}
+    </div>
+  )
+}
+
+export type ImageCarouselProps = {
+  showZoom?: boolean
+  images: Array<{ src: string }>
+  alt: string
+  onThumbnailClick?: (index: number) => void
+  width: number
+  height: number
+  layout?: 'fixed' | 'intrinsic' | 'responsive' | undefined
+  priority?: boolean
+  fill?: boolean
+  loading?: 'eager' | 'lazy'
+  sizes?: string
+  currentSlide?: number
+}
+
+const ImageCarousel: FC<ImageCarouselProps> = ({
+  images,
+  onThumbnailClick,
+  showZoom,
+  currentSlide,
+  alt,
+  ...imageProps
+}) => (
+  <CarouselProvider
+    currentSlide={currentSlide}
+    naturalSlideWidth={1}
+    naturalSlideHeight={1}
+    hasMasterSpinner={false}
+    totalSlides={images.length}
+  >
+    <Slider>
+      {images.map((image, index) => (
+        <Slide index={index} key={index}>
+          {showZoom ? (
+            <ImageWithZoom src={image.src} />
+          ) : (
+            <Image
+              src={image.src}
+              alt={alt || (image as any).altText || `Product image ${index + 1}`}
+              placeholder="blur"
+              blurDataURL={PRODUCT_IMAGE_BLUR_DATA_URL}
+              {...imageProps}
+            />
+          )}
+        </Slide>
+      ))}
+    </Slider>
+    {showZoom && (
+      <CustomDotGroup
+        {...imageProps}
+        onThumbnailClick={onThumbnailClick}
+        images={images}
+      />
+    )}
+  </CarouselProvider>
+)
+
+export default ImageCarousel

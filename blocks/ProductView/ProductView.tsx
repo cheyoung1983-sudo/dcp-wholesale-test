@@ -1,0 +1,238 @@
+import React, { useMemo, useState } from 'react'
+import { jsx } from 'theme-ui'
+import { Grid, Button, Heading } from '@theme-ui/components'
+import OptionPicker from '@components/common/OptionPicker'
+import { NextSeo } from 'next-seo'
+import { useUI } from '@components/common/context'
+import { useCart } from '../../context/CartContext'
+import {
+  prepareVariantsWithOptions,
+  prepareVariantsImages,
+  getPrice,
+} from '@lib/shopify/storefront-data-hooks/src/utils/product'
+import ImageCarousel from '@components/common/ImageCarousel'
+import ProductLoader from './ProductLoader'
+import { Breadcrumbs } from '@components/common/Breadcrumbs'
+import { SocialShareButtons } from '@components/products/SocialShareButtons'
+import { sanitizeRichText } from '@lib/sanitize-html'
+
+interface Props {
+  className?: string
+  children?: any
+  product: ShopifyBuy.Product
+  renderSeo?: boolean
+  description?: string
+  title?: string
+}
+
+const ProductBox: React.FC<Props> = ({
+  product,
+  renderSeo,
+  description = product?.description,
+  title = product?.title,
+}) => {
+  const [loading, setLoading] = useState(false)
+  const [addToCartError, setAddToCartError] = useState<string | null>(null)
+  const { addItem } = useCart()
+  const colors: string[] | undefined = product?.options
+    ?.find((option) => option?.name?.toLowerCase() === 'color')
+    ?.values?.map((op) => op.value as string)
+
+  const sizes: string[] | undefined = product?.options
+    ?.find((option) => option?.name?.toLowerCase() === 'size')
+    ?.values?.map((op) => op.value as string)
+
+  const variants = useMemo(
+    () => prepareVariantsWithOptions(product?.variants),
+    [product?.variants]
+  )
+  const images = useMemo(
+    () => prepareVariantsImages(variants, 'color'),
+    [variants]
+  )
+
+  const { openSidebar } = useUI()
+
+  const initialVariant = variants[0] || {}
+  const [color, setColor] = useState(initialVariant?.color)
+  const [size, setSize] = useState(initialVariant?.size)
+
+  // Derived directly from variants/size/color during render instead of via
+  // an effect + separate state — there's no external system involved, so
+  // this is a pure computation, not a synchronization.
+  const variant = useMemo(() => {
+    return (
+      variants.find((v) => (v.size === size || !size) && (v.color === color || !color)) ||
+      variants[0] ||
+      {}
+    )
+  }, [variants, size, color])
+
+  const addToCart = async () => {
+    if (!variant?.id) {
+      setAddToCartError('This product is currently unavailable.')
+      return
+    }
+
+    setLoading(true)
+    setAddToCartError(null)
+    try {
+      await addItem({
+        variantId: String(variant.id),
+        quantity: 1,
+        title: product?.title,
+        handle: (product as any)?.handle,
+        variantTitle: (variant as any).title,
+        price: (variant as any).priceV2 || (variant as any).price,
+        image: (variant as any).image?.src || (variant as any).image?.url || null,
+      })
+      openSidebar()
+    } catch (err) {
+      setAddToCartError(
+        'We could not add this item to your cart. Please try again.'
+      )
+    } finally {
+      setLoading(false)
+    }
+  }
+  const allImages = (images || [])
+    .map(({ src }) => ({ src: src?.src }))
+    .concat(
+      (product?.images &&
+        product.images.filter(
+          ({ src }) => !images.find((image) => image?.src?.src === src)
+        )) || []
+    )
+
+  return (
+    <React.Fragment>
+      {renderSeo && (
+        <NextSeo
+          title={title}
+          description={description}
+          openGraph={{
+            type: 'website',
+            title: title,
+            description: description,
+            images: [
+              {
+                url: product.images?.[0]?.src!,
+                width: 800,
+                height: 600,
+                alt: title,
+              },
+            ],
+          }}
+        />
+      )}
+      <div className="mb-4">
+        <Breadcrumbs
+          id="product-builder-breadcrumbs"
+          variant="contained"
+          showHomeIcon={true}
+          showBackOnMobile={true}
+          product={product}
+        />
+      </div>
+      <Grid gap={4} columns={[1, 2]}>
+        <div>
+          <div
+            sx={{
+              border: '1px solid gray',
+              padding: 2,
+              marginBottom: 2,
+            }}
+          >
+            <ImageCarousel
+              showZoom
+              alt={title}
+              width={1050}
+              height={1050}
+              priority
+              onThumbnailClick={(index) => {
+                if (images[index]?.color) {
+                  setColor(images[index].color)
+                }
+              }}
+              images={
+                allImages?.length > 0
+                  ? allImages
+                  : [
+                      {
+                        src: '/placeholder-product.svg',
+                      },
+                    ]
+              }
+            ></ImageCarousel>
+          </div>
+        </div>
+        <div sx={{ display: 'flex', flexDirection: 'column' }}>
+          <span sx={{ mt: 0, mb: 2 }}>
+            <Heading>{title}</Heading>
+            <Heading as="h4" aria-label="price" sx={{ mt: 0, mb: 2 }}>
+              {getPrice(variant.priceV2.amount, variant.priceV2.currencyCode)}
+            </Heading>
+          </span>
+          <div dangerouslySetInnerHTML={{ __html: sanitizeRichText(description!) }} />
+          <div>
+            <Grid padding={2} columns={2}>
+              {colors?.length && (
+                <OptionPicker
+                  key="Color"
+                  name="Color"
+                  options={colors}
+                  selected={color}
+                  onChange={(event) => setColor(event.target.value)}
+                />
+              )}
+              {sizes?.length && (
+                <OptionPicker
+                  key="Size"
+                  name="Size"
+                  options={sizes}
+                  selected={size}
+                  onChange={(event) => setSize(event.target.value)}
+                />
+              )}
+            </Grid>
+          </div>
+          <Button
+            name="add-to-cart"
+            disabled={loading}
+            sx={{ margin: 2, display: 'block' }}
+            onClick={addToCart}
+          >
+            Add to Cart {loading && '...'}
+          </Button>
+          {addToCartError && (
+            <p role="alert" sx={{ color: 'primary', margin: 2 }}>
+              {addToCartError}
+            </p>
+          )}
+          <div sx={{ margin: 2, pt: 3, borderTop: '1px solid #e2e8f0' }}>
+            <SocialShareButtons
+              title={product?.title || title}
+              description={product?.description || description}
+              variant="default"
+              showLabel={true}
+            />
+          </div>
+        </div>
+      </Grid>
+    </React.Fragment>
+  )
+}
+
+const ProductView: React.FC<{
+  product: string | ShopifyBuy.Product
+  renderSeo?: boolean
+  description?: string
+  title?: string
+}> = ({ product, ...props }) => {
+  return (
+    <ProductLoader product={product}>
+      {(productObject) => <ProductBox {...props} product={productObject} />}
+    </ProductLoader>
+  )
+}
+export default ProductView

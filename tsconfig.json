@@ -1,0 +1,70 @@
+{
+  "compilerOptions": {
+    "target": "esnext",
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "esnext"
+    ],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "react-jsx",
+    "jsxImportSource": "theme-ui",
+    "paths": {
+      "@lib/*": [
+        "./lib/*"
+      ],
+      "@assets/*": [
+        "./assets/*"
+      ],
+      "@blocks/*": [
+        "./blocks/*"
+      ],
+      "@config/*": [
+        "./config/*"
+      ],
+      "@components/*": [
+        "./components/*"
+      ],
+      "@services/*": [
+        "./services/*"
+      ],
+      "@utils/*": [
+        "./utils/*"
+      ]
+    },
+    "incremental": true,
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ]
+  },
+  "include": [
+    "next-env.d.ts",
+    "blocks/**/*",
+    "components/**/*",
+    "config/**/*",
+    "lib/**/*",
+    "pages/**/*",
+    "utils/**/*",
+    ".next/types/**/*.ts",
+    ".next/dev/types/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "ai",
+    "commerce",
+    "swr",
+    "turborepo"
+  ]
+}

@@ -1,0 +1,180 @@
+/**
+ * Shared Cart LocalStorage Contract & Persistence Bridge
+ *
+ * Centralizes localStorage keys, type schemas, and synchronization logic between
+ * the modern React `CartContext` implementation and legacy `storefront-data-hooks`
+ * bridges to prevent state drift across page reloads.
+ *
+ * @module CartStorage
+ */
+
+/** Centralized localStorage keys used across cart contexts and legacy hooks */
+export const CART_STORAGE_KEYS = {
+  /** Primary key storing modern CartStorageItem array */
+  ITEMS: 'shopify_bag_items_v2',
+  /** Secondary fallback key storing cart items */
+  ITEMS_FALLBACK: 'shopify_cart_items',
+  /** Unique Shopify Storefront API cart ID */
+  CART_ID: 'shopify_bag_cart_id_v2',
+  /** Direct web checkout redirect URL from Shopify Storefront API */
+  CHECKOUT_URL: 'shopify_bag_checkout_url_v2',
+  /** Legacy storefront-data-hooks cart object key */
+  LEGACY_CART: 'shopify_local_store__cart',
+} as const
+
+export const LEGACY_CART_STORAGE_KEY = CART_STORAGE_KEYS.LEGACY_CART
+
+/** Core data structure representing a cart item in local storage */
+export type CartStorageItem = {
+  id: string
+  lineId?: string
+  variantId: string
+  productId?: string
+  title: string
+  handle?: string
+  variantTitle?: string
+  quantity: number
+  price?: {
+    amount: string
+    currencyCode: string
+  }
+  compareAtPrice?: {
+    amount: string
+    currencyCode: string
+  } | null
+  image?: {
+    url: string
+    src?: string
+    altText?: string | null
+    width?: number | null
+    height?: number | null
+  } | null
+  options?: Array<{ name: string; value: string }>
+  vendor?: string
+  sku?: string
+  customAttributes?: Array<{ key: string; value: string }>
+}
+
+/**
+ * Loads stored cart items and identifiers from `localStorage` across primary,
+ * fallback, and legacy `storefront-data-hooks` keys.
+ *
+ * @returns Object containing parsed `items`, `cartId`, and `checkoutUrl`
+ */
+export function loadStoredCartItems(): {
+  items: CartStorageItem[]
+  cartId: string | null
+  checkoutUrl: string | null
+} {
+  if (typeof window === 'undefined') {
+    return { items: [], cartId: null, checkoutUrl: null }
+  }
+
+  let items: CartStorageItem[] = []
+  let cartId: string | null = null
+  let checkoutUrl: string | null = null
+
+  try {
+    const raw = window.localStorage.getItem(CART_STORAGE_KEYS.ITEMS)
+    if (raw) {
+      const parsed = JSON.parse(raw)
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        items = parsed
+      }
+      // Ensure each stored item has a price object to satisfy CartItem type
+      items = items.map((it) => ({
+        ...it,
+        price: it.price ?? { amount: '0.00', currencyCode: 'USD' },
+      }))
+    }
+  } catch (e) {
+    console.warn(`[CartContext] Failed to parse primary cart items from localStorage:`, e)
+  }
+
+  if (items.length === 0) {
+    try {
+      const raw = window.localStorage.getItem(CART_STORAGE_KEYS.ITEMS_FALLBACK)
+      if (raw) {
+        const parsed = JSON.parse(raw)
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          items = parsed
+        }
+        // Ensure each stored item has a price object to satisfy CartItem type
+        items = items.map((it) => ({
+          ...it,
+          price: it.price ?? { amount: '0.00', currencyCode: 'USD' },
+        }))
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  // The legacy storefront-data-hooks key (shopify_local_store__cart) is no
+  // longer read: the legacy provider rewrites it with its own Shopify cart,
+  // which let a stale cart id (and removed lines) resurface. Drop it.
+  clearLegacyCartStorage()
+
+  try {
+    const storedCartId = window.localStorage.getItem(CART_STORAGE_KEYS.CART_ID)
+    const storedCheckout = window.localStorage.getItem(CART_STORAGE_KEYS.CHECKOUT_URL)
+    // A cart id with no items is stale and must not be reused.
+    if (items.length > 0) {
+      if (storedCartId) cartId = storedCartId
+      if (storedCheckout) checkoutUrl = storedCheckout
+    }
+  } catch {
+    // ignore
+  }
+
+  return { items, cartId, checkoutUrl }
+}
+
+/**
+ * Persists cart items, cart ID, and checkout URL across all relevant localStorage keys
+ * and synchronizes the legacy storefront-data-hooks storage format so all parts of the
+ * app stay consistent across refreshes.
+ */
+export function persistAllCartData(
+  items: CartStorageItem[],
+  cartId: string | null,
+  checkoutUrl: string | null
+): void {
+  if (typeof window === 'undefined') return
+
+  try {
+    if (items.length > 0) {
+      window.localStorage.setItem(CART_STORAGE_KEYS.ITEMS, JSON.stringify(items))
+      window.localStorage.setItem(CART_STORAGE_KEYS.ITEMS_FALLBACK, JSON.stringify(items))
+    } else {
+      window.localStorage.removeItem(CART_STORAGE_KEYS.ITEMS)
+      window.localStorage.removeItem(CART_STORAGE_KEYS.ITEMS_FALLBACK)
+    }
+
+    if (cartId) {
+      window.localStorage.setItem(CART_STORAGE_KEYS.CART_ID, cartId)
+    } else {
+      window.localStorage.removeItem(CART_STORAGE_KEYS.CART_ID)
+    }
+
+    if (checkoutUrl) {
+      window.localStorage.setItem(CART_STORAGE_KEYS.CHECKOUT_URL, checkoutUrl)
+    } else {
+      window.localStorage.removeItem(CART_STORAGE_KEYS.CHECKOUT_URL)
+    }
+
+    clearLegacyCartStorage()
+  } catch (e) {
+    console.warn('[CartContext] Failed to persist cart data to localStorage:', e)
+  }
+}
+
+/** Removes the legacy storefront-data-hooks cart key so its cart id can't resurface. */
+export function clearLegacyCartStorage(): void {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.removeItem(CART_STORAGE_KEYS.LEGACY_CART)
+  } catch {
+    // ignore
+  }
+}

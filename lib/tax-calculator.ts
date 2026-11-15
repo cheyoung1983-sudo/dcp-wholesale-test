@@ -1,0 +1,491 @@
+/**
+ * Avalara AvaTax Tax Calculation & Tribal Exemption Service
+ *
+ * Integrates with Avalara AvaTax API (v2) using Entity Use Code 'C' (Native American / Tribal Member)
+ * to calculate sales tax exemptions for qualified on-reservation transactions.
+ *
+ * @module TaxCalculator
+ */
+
+import { checkCoordinatesIntersectAIANA, isCoordinatesOnReservation } from './geofencing.ts'
+import { evaluateAddressGeofence } from './tribal/geofencing.ts'
+
+/** Avalara Entity Use Code 'C' for Native American Tribal Exemption */
+export const AVATAX_ENTITY_USE_CODE_TRIBAL = 'C'
+
+/**
+ * Commercial discount for enrolled tribal members, as a fraction of subtotal.
+ * Business policy, not tax law. NOTE: store copy limits this discount to repair
+ * services (not accessories); this engine currently applies it to every line.
+ * Change the policy here, not inline.
+ */
+export const TRIBAL_MEMBER_DISCOUNT_RATE = 0.2
+
+/**
+ * LOCAL FALLBACK RATES ONLY. Used when AvaTax credentials are absent or the
+ * AvaTax call fails, so quotes still render. These are flat placeholders, not a
+ * real jurisdiction lookup, and must not be treated as authoritative for
+ * filing/remittance. Real rates come from AvaTax.
+ */
+export const FALLBACK_SALES_TAX_RATES = Object.freeze({
+  /** State sales tax */
+  state: 0.06,
+  /** County sales tax */
+  county: 0.015,
+  /** City sales tax */
+  city: 0.0075,
+})
+
+/**
+ * Environment variables the AvaTax client reads. Credentials come only from
+ * server-side env (or an explicit AvaTaxConfig passed by server code); never
+ * hardcode them and never expose them with a NEXT_PUBLIC_ prefix.
+ */
+export const AVATAX_ENV_VARS = Object.freeze({
+  accountId: 'AVALARA_ACCOUNT_ID',
+  licenseKey: 'AVALARA_LICENSE_KEY',
+  bearerToken: 'AVALARA_BEARER_TOKEN',
+  companyCode: 'AVALARA_COMPANY_CODE',
+  environment: 'AVALARA_ENVIRONMENT',
+})
+
+/** Address specification for tax jurisdiction lookup and geofencing */
+export interface TaxAddress {
+  line1: string
+  line2?: string
+  city: string
+  /** State or territory code (e.g. 'AZ', 'CA', 'WA', 'NM') */
+  region: string
+  postalCode: string
+  /** Two-letter ISO country code (defaults to 'US') */
+  country?: string
+  latitude?: number
+  longitude?: number
+}
+
+/** Individual line item for tax calculation */
+export interface TaxLineItem {
+  id?: string
+  number?: string
+  itemCode: string
+  description?: string
+  quantity: number
+  amount: number
+  /** Standard Avalara tax code (defaults to personal property 'P0000000') */
+  taxCode?: string
+  entityUseCode?: string
+}
+
+/** Calculation request payload sent to tax calculator */
+export interface TaxCalculatorRequest {
+  transactionCode?: string
+  customerId: string
+  /** Flag indicating enrolled tribal member status */
+  isTribalMember: boolean
+  tribalNation?: string
+  tribalEnrollmentId?: string
+  shippingAddress: TaxAddress
+  lines: TaxLineItem[]
+  /** If true, commits transaction to Avalara AvaTax as SalesInvoice */
+  commit?: boolean
+  date?: string
+  currencyCode?: string
+}
+
+/** Tax jurisdiction breakdown details */
+export interface TaxJurisdictionDetail {
+  jurisdictionName: string
+  jurisdictionType: 'State' | 'County' | 'City' | 'Special' | 'Tribal'
+  rate: number
+  tax: number
+  exempt: boolean
+  exemptionReason?: string
+}
+
+/** Final tax calculation and exemption determination result */
+export interface TaxCalculationResult {
+  transactionCode: string
+  totalAmount: number
+  subtotal: number
+  totalDiscount: number
+  taxableAmount: number
+  totalTax: number
+  isTaxExempt: boolean
+  entityUseCode?: string
+  onReservation: boolean
+  reservationName?: string
+  isSelfAdministeredTribalTax: boolean
+  tribalRemittance?: {
+    applicable: boolean
+    tribalNation?: string
+    tribalTaxRate?: number
+    tribalTaxAmount?: number
+    remittanceInstructions?: string
+  }
+  taxDetails: TaxJurisdictionDetail[]
+  rawAvaTaxResponse?: any
+}
+
+/** Avalara AvaTax connection configuration */
+export interface AvaTaxConfig {
+  accountId?: string
+  licenseKey?: string
+  bearerToken?: string
+  companyCode?: string
+  environment?: 'sandbox' | 'production'
+}
+
+/**
+ * Validates whether an order qualifies for tribal tax exemption:
+ * Requires BOTH enrolled tribal member status AND verified on-reservation delivery address.
+ */
+export function isQualifiedOnReservationTribalTransaction(params: {
+  isTribalMember: boolean
+  shippingAddress: TaxAddress
+}): {
+  qualified: boolean
+  onReservation: boolean
+  reservationName?: string
+  tribalNation?: string
+  isSelfAdministered: boolean
+  tribalTaxRate?: number
+} {
+  if (!params.isTribalMember) {
+    return {
+      qualified: false,
+      onReservation: false,
+      isSelfAdministered: false,
+    }
+  }
+
+  // 1. Coordinate check if available
+  let onRes = false
+  let resName: string | undefined
+  let nationName: string | undefined
+  let isSelfAdmin = false
+  let tribalRate: number | undefined
+
+  if (
+    typeof params.shippingAddress.latitude === 'number' &&
+    typeof params.shippingAddress.longitude === 'number'
+  ) {
+    const coordResult = checkCoordinatesIntersectAIANA(
+      params.shippingAddress.latitude,
+      params.shippingAddress.longitude
+    )
+    if (coordResult.onReservation) {
+      onRes = true
+      resName = coordResult.reservationName
+      isSelfAdmin = coordResult.isSelfAdministered ?? false
+      tribalRate = coordResult.tribalTaxRate
+    }
+  }
+
+  // 2. Fall back to postal/address geofencing engine
+  if (!onRes) {
+    const geo = evaluateAddressGeofence({
+      address1: params.shippingAddress.line1,
+      city: params.shippingAddress.city,
+      province: params.shippingAddress.region,
+      zip: params.shippingAddress.postalCode,
+      country: params.shippingAddress.country || 'US',
+    })
+    onRes = geo.onReservation
+    resName = geo.reservationName
+    nationName = geo.tribalNation
+    isSelfAdmin = geo.isSelfAdministered
+    tribalRate = geo.tribalTaxRate
+  }
+
+  return {
+    qualified: onRes,
+    onReservation: onRes,
+    reservationName: resName,
+    tribalNation: nationName,
+    isSelfAdministered: isSelfAdmin,
+    tribalTaxRate: tribalRate,
+  }
+}
+
+/**
+ * Builds the standard Avalara AvaTax REST API v2 CreateTransaction payload
+ */
+export function buildAvaTaxTransactionPayload(
+  request: TaxCalculatorRequest,
+  qualification: ReturnType<typeof isQualifiedOnReservationTribalTransaction>,
+  config?: AvaTaxConfig
+) {
+  const companyCode = config?.companyCode || process.env[AVATAX_ENV_VARS.companyCode] || 'DEFAULT'
+  const entityUseCode = qualification.qualified ? AVATAX_ENTITY_USE_CODE_TRIBAL : undefined
+
+  return {
+    type: request.commit ? 'SalesInvoice' : 'SalesOrder',
+    companyCode,
+    code: request.transactionCode || `TX-${Date.now()}`,
+    date: request.date || new Date().toISOString().split('T')[0],
+    customerCode: request.customerId || 'GUEST',
+    entityUseCode,
+    addresses: {
+      singleLocation: {
+        line1: request.shippingAddress.line1,
+        line2: request.shippingAddress.line2 || '',
+        city: request.shippingAddress.city,
+        region: request.shippingAddress.region,
+        postalCode: request.shippingAddress.postalCode,
+        country: request.shippingAddress.country || 'US',
+        latitude: request.shippingAddress.latitude,
+        longitude: request.shippingAddress.longitude,
+      },
+    },
+    lines: request.lines.map((line, index) => ({
+      number: line.number || String(index + 1),
+      itemCode: line.itemCode,
+      description: line.description || line.itemCode,
+      quantity: line.quantity,
+      amount: line.amount * (line.quantity || 1),
+      taxCode: line.taxCode || 'P0000000', // General tangible personal property
+      entityUseCode: line.entityUseCode || entityUseCode,
+    })),
+    commit: !!request.commit,
+    currencyCode: request.currencyCode || 'USD',
+  }
+}
+
+/**
+ * Direct Avalara AvaTax REST API Client
+ */
+export async function createAvaTaxTransaction(
+  payload: any,
+  config?: AvaTaxConfig
+): Promise<any> {
+  const accountId = config?.accountId || process.env[AVATAX_ENV_VARS.accountId]
+  const licenseKey = config?.licenseKey || process.env[AVATAX_ENV_VARS.licenseKey]
+  const bearerToken = config?.bearerToken || process.env[AVATAX_ENV_VARS.bearerToken]
+  const env = config?.environment || process.env[AVATAX_ENV_VARS.environment] || 'sandbox'
+
+  const baseUrl =
+    env === 'production'
+      ? 'https://rest.avatax.com'
+      : 'https://sandbox-rest.avatax.com'
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'X-Avalara-Client': 'DisplayCellPros; TribalTaxEngine; 1.0.0; NextJs',
+  }
+
+  if (bearerToken) {
+    headers['Authorization'] = `Bearer ${bearerToken}`
+  } else if (accountId && licenseKey) {
+    const authString = Buffer.from(`${accountId}:${licenseKey}`).toString('base64')
+    headers['Authorization'] = `Basic ${authString}`
+  } else {
+    // No credentials provided; caller will handle simulated execution
+    return null
+  }
+
+  const response = await fetch(`${baseUrl}/api/v2/transactions/create`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(payload),
+  })
+
+  if (!response.ok) {
+    const errorText = await response.text()
+    throw new Error(`AvaTax API error (${response.status}): ${errorText}`)
+  }
+
+  return response.json()
+}
+
+/**
+ * Main Service Function:
+ * Integrates with the Avalara AvaTax API using Entity Use Code 'C' to calculate tax exemptions
+ * for qualified on-reservation transactions.
+ */
+export async function calculateTribalTransactionTax(
+  request: TaxCalculatorRequest,
+  config?: AvaTaxConfig
+): Promise<TaxCalculationResult> {
+  const subtotal = request.lines.reduce(
+    (acc, line) => acc + line.amount * (line.quantity || 1),
+    0
+  )
+
+  // Commercial discount for enrolled tribal members (see TRIBAL_MEMBER_DISCOUNT_RATE)
+  const totalDiscount = request.isTribalMember
+    ? Number((subtotal * TRIBAL_MEMBER_DISCOUNT_RATE).toFixed(2))
+    : 0
+  const taxableBase = Math.max(0, subtotal - totalDiscount)
+
+  // Evaluate on-reservation statutory qualification
+  const qualification = isQualifiedOnReservationTribalTransaction({
+    isTribalMember: request.isTribalMember,
+    shippingAddress: request.shippingAddress,
+  })
+
+  const avaTaxPayload = buildAvaTaxTransactionPayload(request, qualification, config)
+
+  // Try live AvaTax API call if credentials exist
+  let rawAvaTaxResponse = null
+  try {
+    rawAvaTaxResponse = await createAvaTaxTransaction(avaTaxPayload, config)
+  } catch (err) {
+    // Log the message only; the full error object can carry request details.
+    console.warn(
+      'AvaTax API call failed; using local fallback tax rules:',
+      err instanceof Error ? err.message : String(err)
+    )
+  }
+
+  // NOTE: a live AvaTax response is attached as rawAvaTaxResponse but the
+  // figures below are still computed from the local rules/fallback rates.
+  const standardRates = FALLBACK_SALES_TAX_RATES
+
+  // When transaction qualifies for Entity Use Code 'C'
+  if (qualification.qualified) {
+    const entityUseCode = AVATAX_ENTITY_USE_CODE_TRIBAL
+
+    // Case 1: Self-administered tribal nation (e.g. Navajo Nation 6%, Tulalip 3%, Gila River 4%)
+    if (qualification.isSelfAdministered && qualification.tribalTaxRate) {
+      const tribalTax = Number((taxableBase * qualification.tribalTaxRate).toFixed(2))
+
+      return {
+        transactionCode: avaTaxPayload.code,
+        totalAmount: Number((taxableBase + tribalTax).toFixed(2)),
+        subtotal,
+        totalDiscount,
+        taxableAmount: taxableBase,
+        totalTax: tribalTax,
+        isTaxExempt: true,
+        entityUseCode,
+        onReservation: true,
+        reservationName: qualification.reservationName,
+        isSelfAdministeredTribalTax: true,
+        tribalRemittance: {
+          applicable: true,
+          tribalNation: qualification.tribalNation || qualification.reservationName,
+          tribalTaxRate: qualification.tribalTaxRate,
+          tribalTaxAmount: tribalTax,
+          remittanceInstructions: `Apply Entity Use Code 'C'. State/local taxes are 100% exempt. Remit ${(qualification.tribalTaxRate * 100).toFixed(1)}% tribal tax directly to ${qualification.tribalNation || 'Tribal Government'}.`,
+        },
+        taxDetails: [
+          {
+            jurisdictionName: `${request.shippingAddress.region} Department of Revenue`,
+            jurisdictionType: 'State',
+            rate: standardRates.state,
+            tax: 0,
+            exempt: true,
+            exemptionReason: "Entity Use Code 'C': Enrolled Tribal Member on Reservation",
+          },
+          {
+            jurisdictionName: `${request.shippingAddress.city} County / Local`,
+            jurisdictionType: 'County',
+            rate: standardRates.county + standardRates.city,
+            tax: 0,
+            exempt: true,
+            exemptionReason: "Entity Use Code 'C': Enrolled Tribal Member on Reservation",
+          },
+          {
+            jurisdictionName: qualification.tribalNation || qualification.reservationName || 'Tribal Government',
+            jurisdictionType: 'Tribal',
+            rate: qualification.tribalTaxRate,
+            tax: tribalTax,
+            exempt: false,
+          },
+        ],
+        rawAvaTaxResponse,
+      }
+    }
+
+    // Case 2: Fully exempt on-reservation delivery (0% state, 0% local, 0% tribal)
+    return {
+      transactionCode: avaTaxPayload.code,
+      totalAmount: taxableBase,
+      subtotal,
+      totalDiscount,
+      taxableAmount: 0,
+      totalTax: 0,
+      isTaxExempt: true,
+      entityUseCode,
+      onReservation: true,
+      reservationName: qualification.reservationName,
+      isSelfAdministeredTribalTax: false,
+      tribalRemittance: {
+        applicable: false,
+        tribalTaxAmount: 0,
+        tribalTaxRate: 0,
+      },
+      taxDetails: [
+        {
+          jurisdictionName: `${request.shippingAddress.region} Department of Revenue`,
+          jurisdictionType: 'State',
+          rate: standardRates.state,
+          tax: 0,
+          exempt: true,
+          exemptionReason: "Entity Use Code 'C': Tribal Member on-reservation delivery (CDTFA-146-RES / WAC 458-20-192)",
+        },
+        {
+          jurisdictionName: `${request.shippingAddress.city} County / Local`,
+          jurisdictionType: 'County',
+          rate: standardRates.county + standardRates.city,
+          tax: 0,
+          exempt: true,
+          exemptionReason: "Entity Use Code 'C': Tribal Member on-reservation delivery",
+        },
+      ],
+      rawAvaTaxResponse,
+    }
+  }
+
+  // Non-exempt transaction (either off-reservation or non-enrolled customer)
+  const combinedRate = standardRates.state + standardRates.county + standardRates.city
+  const stateTax = Number((taxableBase * standardRates.state).toFixed(2))
+  const countyTax = Number((taxableBase * standardRates.county).toFixed(2))
+  const cityTax = Number((taxableBase * standardRates.city).toFixed(2))
+  const totalTax = Number((stateTax + countyTax + cityTax).toFixed(2))
+
+  return {
+    transactionCode: avaTaxPayload.code,
+    totalAmount: Number((taxableBase + totalTax).toFixed(2)),
+    subtotal,
+    totalDiscount,
+    taxableAmount: taxableBase,
+    totalTax,
+    isTaxExempt: false,
+    entityUseCode: undefined,
+    onReservation: qualification.onReservation,
+    reservationName: qualification.reservationName,
+    isSelfAdministeredTribalTax: false,
+    tribalRemittance: {
+      applicable: false,
+      tribalTaxAmount: 0,
+      tribalTaxRate: 0,
+    },
+    taxDetails: [
+      {
+        jurisdictionName: `${request.shippingAddress.region} Department of Revenue`,
+        jurisdictionType: 'State',
+        rate: standardRates.state,
+        tax: stateTax,
+        exempt: false,
+      },
+      {
+        jurisdictionName: `${request.shippingAddress.city} County`,
+        jurisdictionType: 'County',
+        rate: standardRates.county,
+        tax: countyTax,
+        exempt: false,
+      },
+      {
+        jurisdictionName: `${request.shippingAddress.city} City`,
+        jurisdictionType: 'City',
+        rate: standardRates.city,
+        tax: cityTax,
+        exempt: false,
+      },
+    ],
+    rawAvaTaxResponse,
+  }
+}
+
+export default calculateTribalTransactionTax
