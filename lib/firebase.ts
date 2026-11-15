@@ -29,12 +29,57 @@ function readFirebaseConfig(): FirebaseOptions & { firestoreDatabaseId?: string 
 }
 
 export const firebaseConfig = readFirebaseConfig()
-const app = initializeApp(firebaseConfig)
-export const db = firebaseConfig.firestoreDatabaseId
-  ? getFirestore(app, firebaseConfig.firestoreDatabaseId)
-  : getFirestore(app)
-export const auth = getAuth(app)
-export const googleProvider = new GoogleAuthProvider()
+
+type FirebaseConfig = ReturnType<typeof readFirebaseConfig>
+
+function isFirebaseConfigured(cfg: FirebaseConfig): boolean {
+  const key = (cfg.apiKey || '').trim()
+  return Boolean(key) && !key.startsWith('YOUR_')
+}
+
+let app: ReturnType<typeof initializeApp> | undefined
+let _db: ReturnType<typeof getFirestore> | undefined
+let _auth: ReturnType<typeof getAuth> | undefined
+let _googleProvider: GoogleAuthProvider | undefined
+
+function ensureFirebase() {
+  if (app && _db && _auth && _googleProvider) return
+  const cfg = readFirebaseConfig()
+  if (!isFirebaseConfigured(cfg)) {
+    throw new Error('Firebase is not configured. Set NEXT_PUBLIC_FIREBASE_API_KEY (and the other NEXT_PUBLIC_FIREBASE_* / NEXT_PUBLIC_FIRESTORE_DATABASE_ID values) for a test project.')
+  }
+  app = initializeApp(cfg)
+  _db = cfg.firestoreDatabaseId ? getFirestore(app, cfg.firestoreDatabaseId) : getFirestore(app)
+  _auth = getAuth(app)
+  _googleProvider = new GoogleAuthProvider()
+}
+
+/** Lazy Firestore handle so `next build` can collect pages without live Firebase credentials. */
+export const db = new Proxy({} as ReturnType<typeof getFirestore>, {
+  get(_target, prop) {
+    ensureFirebase()
+    const value = (_db as any)[prop]
+    return typeof value === 'function' ? value.bind(_db) : value
+  },
+})
+
+/** Lazy Auth handle so `next build` can collect pages without live Firebase credentials. */
+export const auth = new Proxy({} as ReturnType<typeof getAuth>, {
+  get(_target, prop) {
+    ensureFirebase()
+    const value = (_auth as any)[prop]
+    return typeof value === 'function' ? value.bind(_auth) : value
+  },
+})
+
+/** Lazy Google provider; created on first use. */
+export const googleProvider = new Proxy({} as GoogleAuthProvider, {
+  get(_target, prop) {
+    ensureFirebase()
+    const value = (_googleProvider as any)[prop]
+    return typeof value === 'function' ? value.bind(_googleProvider) : value
+  },
+})
 
 /**
  * Validates the Firestore connection and handles "offline" errors.
