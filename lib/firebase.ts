@@ -8,11 +8,11 @@ import fileConfig from '../firebase-applet-config.json';
  * firebase-applet-config.json). Never commit real project identifiers.
  */
 function readFirebaseConfig(): FirebaseOptions & { firestoreDatabaseId?: string } {
-  const file = fileConfig as Record<string, string>
+  const file = fileConfig as unknown as Record<string, unknown>
   const envOr = (envName: string, fileKey: string, placeholderPrefixes: string[] = ['YOUR_']) => {
     const fromEnv = (process.env[envName] || '').trim()
     if (fromEnv) return fromEnv
-    const fromFile = (file[fileKey] || '').trim()
+    const fromFile = String(file[fileKey] ?? '').trim()
     if (fromFile && !placeholderPrefixes.some((p) => fromFile.startsWith(p))) return fromFile
     return ''
   }
@@ -30,7 +30,9 @@ function readFirebaseConfig(): FirebaseOptions & { firestoreDatabaseId?: string 
 
 export const firebaseConfig = readFirebaseConfig()
 const app = initializeApp(firebaseConfig)
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId)
+export const db = firebaseConfig.firestoreDatabaseId
+  ? getFirestore(app, firebaseConfig.firestoreDatabaseId)
+  : getFirestore(app)
 export const auth = getAuth(app)
 export const googleProvider = new GoogleAuthProvider()
 
